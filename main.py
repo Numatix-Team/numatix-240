@@ -51,8 +51,10 @@ class Strategy:
         data["volume_call"]=data["volume_call"].round(0)
         data["volume_put"]=data["volume_put"].round(0)
         data["combined_volume"]=data["combined_volume"].round(0)
-        data[""]
         print(data)
+
+        current_price=self.broker.current_price("SPX", "CBOE")
+        print(current_price)
 
 class StrategyBroker:
     def __init__(self, config_path="config.json"):
@@ -83,7 +85,10 @@ class StrategyBroker:
             print("Could not get next order ID from IBKR")
 
     def current_price(self, symbol, exchange):
-        return self.ib_broker.get_index_spot(symbol, exchange)
+        with self.counter_lock:
+            req_id = self.request_id_counter + 2000
+            self.request_id_counter += 1 
+        return self.ib_broker.get_index_spot(symbol, req_id, exchange)
 
     def get_option_premium(self, symbol, expiry, strike, right):
         with self.counter_lock:
