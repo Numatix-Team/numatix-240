@@ -5,11 +5,12 @@ import pandas as pd
 import numpy as np
 from db.db_logger import OptionDBLogger
 import time
-from datetime import datetime, time
+from datetime import datetime
+import time as time_mod
 import pytz
 from log import setup_logger
 setup_logger()
-
+import os
 import json
 import time as time_mod
 import pandas as pd
@@ -31,6 +32,9 @@ class Strategy:
     def __init__(self, manager, broker, config_path="config.json"):
         self.manager = manager
         self.broker = broker
+        self._load_positions()   # === ADDED ===
+
+
 
         with open(config_path, "r") as f:
             cfg = json.load(f)
@@ -221,12 +225,23 @@ class Strategy:
 
         self.vwap = float(df["turnover"].sum()) / float(tot_vol)
         print(f"[Strategy] VWAP={self.vwap:.2f}")
+        today = datetime.now(self.tz).date()
+        file_path = f"signals/calculate_indicators{today}.csv"
+        # If file doesn't exist → write header
+        if not os.path.exists(file_path):
+            df.to_csv(file_path, index=False)
+        else:
+            # Append without header
+            df.to_csv(file_path, mode="a", index=False, header=False)
+
+        print(f"[Strategy] Historical data saved → {file_path}")
+        self.hist_df = df
         return True
 
     # -----------------------------------------------------------------
     # 3. Signal Generation
     # -----------------------------------------------------------------
-    def generate_signals(self):
+    def  generate_signals(self):
         now = datetime.now(self.tz).time()
 
         if not (self.entry_start <= now <= self.entry_end):
@@ -254,9 +269,13 @@ class Strategy:
         entry_threshold = self.vwap * self.entry_vwap_mult
 
         if not self.position_open and combined < entry_threshold:
-            return {"action": "SELL_STRADDLE", "combined": combined}
-
-        return {"action": "NONE"}
+            sig={"action": "SELL_STRADDLE", "combined": combined}
+            self._save_signal(sig)
+            return sig  
+        
+        sig={"action": "NONE"}
+        self._save_signal(sig)
+        return sig  
 
     # -----------------------------------------------------------------
     # 4. Dummy Execution
@@ -280,6 +299,8 @@ class Strategy:
             "strike_call": self.call_strike,
             "strike_put": self.put_strike
         }
+        self._save_positions()
+        #do not forget to return the order statements
 
     # -----------------------------------------------------------------
     def manage_positions(self, poll_interval):
@@ -310,7 +331,7 @@ class Strategy:
             if pnl_pct <= -self.sl_pct:
                 return self.exit_position("STOP LOSS")
 
-            time.sleep(poll_interval)
+            time_mod.sleep(poll_interval)
 
 
     # -----------------------------------------------------------------
@@ -334,17 +355,62 @@ class Strategy:
         print("[Strategy] Running...")
 
         while self.manager.keep_running:
+#calculating vwap every minute 
+            if self.fetch_data():
+                self.calculate_indicators()
             signal = self.generate_signals()
-
             if signal.get("action") == "SELL_STRADDLE":
                 self.execute_trade(signal)
 
             if self.position_open:
                 res = self.manage_positions(poll_interval)
                 print(res)
-
-
             time_mod.sleep(poll_interval)
+    def _save_signal(self, signal: Dict[str, Any]):
+        """Append signals to daily CSV inside signals/ directory."""
+        os.makedirs("signals", exist_ok=True)
+        today = datetime.now(self.tz).strftime("%Y-%m-%d")
+        path = f"signals/{today}_signals.csv"
+
+        row = {
+            "timestamp": datetime.now(self.tz).isoformat(),
+            "action": signal.get("action"),
+            "combined": signal.get("combined"),
+            "call_strike": self.call_strike,
+            "put_strike": self.put_strike,
+            "vwap": self.vwap
+        }
+
+        df = pd.DataFrame([row])
+
+        if not os.path.exists(path):
+            df.to_csv(path, index=False)
+        else:
+            df.to_csv(path, mode="a", index=False, header=False)
+
+
+    def _load_positions(self):
+        """Load position.json if exists."""
+        if os.path.exists("positions.json"):
+            try:
+                with open("positions.json", "r") as f:
+                    data = json.load(f)
+                    if data.get("position_open"):
+                        self.position_open = True
+                        self.position = data["position"]
+                        print("[Strategy] Restored open position from file.")
+            except:
+                pass
+
+
+    def _save_positions(self):
+        """Save current position state."""
+        data = {
+            "position_open": self.position_open,
+            "position": self.position
+        }
+        with open("positions.json", "w") as f:
+            json.dump(data, f, indent=4)
 
 class StrategyBroker:
     def __init__(self, config_path="config.json"):
