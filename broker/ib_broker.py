@@ -417,12 +417,12 @@ class IBBroker(EWrapper, EClient):
         # request option data + greeks
         self.reqMktData(req_id, contract, "100,101", False, False, [])
 
-        timeout = 20
-        for _ in range(timeout):
-            time.sleep(0.1)
-            with self.lock:
-                if req_id in self.prices:
-                    break
+        # timeout = 20
+        # for _ in range(timeout):
+        #     time.sleep(0.1)
+        #     with self.lock:
+        #         if req_id in self.prices:
+        #             break
 
         ticker = self.prices.get(req_id, {})
         self.cancelMktData(req_id)
@@ -435,4 +435,50 @@ class IBBroker(EWrapper, EClient):
             "volume": ticker.get("volume", None)
         }
 
+    def get_option_ohlc(self, symbol, expiry, strike, right, duration="1 D", bar_size="1 min", req_id=5001):
+        # Build contract
+        contract = Contract()
+        contract.symbol = symbol
+        contract.secType = "OPT"
+        contract.exchange = "SMART"
+        contract.currency = "USD"
+        contract.lastTradeDateOrContractMonth = expiry
+        contract.strike = float(strike)
+        contract.right = right
+        contract.multiplier = "100"
 
+        # Request historical bars
+        self.reqHistoricalData(
+            req_id,
+            contract,
+            "",                  # endDateTime (empty = now)
+            duration,            # how far back
+            bar_size,            # candle size
+            "TRADES",            # data type
+            0,                   # useRTH=0 => include pre/post market
+            1,                   # formatDate=1 => string dates
+            False,               # keepUpToDate
+            []
+        )
+
+        # Wait until data arrives
+        timeout = 20
+        for _ in range(timeout):
+            time.sleep(0.1)
+            if req_id in self.historical_data:
+                break
+
+        bars = self.historical_data.pop(req_id, [])
+        ohlc = [
+            {
+                "time": b["date"],
+                "open": b["open"],
+                "high": b["high"],
+                "low": b["low"],
+                "close": b["close"],
+                "volume": b["volume"]
+            }
+            for b in bars
+        ]
+
+        return ohlc

@@ -5,7 +5,7 @@ import pandas as pd
 import numpy as np
 from db.db_logger import OptionDBLogger
 import time
-from datetime import datetime
+from datetime import datetime, time
 import pytz
 
 class Strategy:
@@ -29,8 +29,30 @@ class Strategy:
         self.max_bid_ask_spread = self.config["trade_parameters"]["max_bid_ask_spread"]
 
     def run(self):
-        price = self.broker.get_option_premium("SPX", "20251212", 6800, "C")
-        print(price)
+        x = self.broker.get_option_ohlc("SPX", "20251208", 6870, "C")
+        y=self.broker.get_option_ohlc("SPX", "20251208", 6870, "P")
+        # x["time"] = pd.to_datetime(x["time"], format="%Y%m%d %H:%M:%S")
+
+        # # Filter between 09:30 and 16:00
+        # x_filtered = x[
+        #     (x["time"].dt.time >= time(9, 30)) &
+        #     (x["time"].dt.time <= time(16, 0))
+        # ]
+
+        # print(x_filtered)
+        data=x.merge(y, on="time", suffixes=("_call", "_put"))
+        data["combined_volume"]=data["volume_call"]+data["volume_put"]
+        data=data[["time","close_call","close_put","volume_call","volume_put","combined_volume"]]
+        data["vwap"]=data["close_call"]*data["volume_call"]+data["close_put"]*data["volume_put"]/data["combined_volume"]
+        data["vwap"]=data["vwap"]/data["combined_volume"]
+        data["vwap"]=data["vwap"].round(2)
+        data["close_call"]=data["close_call"].round(2)
+        data["close_put"]=data["close_put"].round(2)
+        data["volume_call"]=data["volume_call"].round(0)
+        data["volume_put"]=data["volume_put"].round(0)
+        data["combined_volume"]=data["combined_volume"].round(0)
+        data[""]
+        print(data)
 
 class StrategyBroker:
     def __init__(self, config_path="config.json"):
@@ -55,7 +77,7 @@ class StrategyBroker:
         next_id = self.get_next_available_order_id()
         if next_id:
             with self.counter_lock:
-                self.request_id_counter = next_id - 2000  # Adjust counter to match order ID range
+                self.request_id_counter = next_id - 2000
             print(f"Reset order counter to start from IBKR ID: {next_id}")
         else:
             print("Could not get next order ID from IBKR")
@@ -65,7 +87,7 @@ class StrategyBroker:
 
     def get_option_premium(self, symbol, expiry, strike, right):
         with self.counter_lock:
-            req_id = self.request_id_counter + 3000  # Offset for index data
+            req_id = self.request_id_counter + 3000
             self.request_id_counter += 1    
         return self.ib_broker.get_option_premium(symbol, expiry, strike, right, req_id)
 
@@ -75,6 +97,13 @@ class StrategyBroker:
             self.request_id_counter += 1
 
         return self.ib_broker.get_option_tick(symbol, expiry, strike, right, req_id)
+    
+    def get_option_ohlc(self, symbol, expiry, strike, right, duration="1 D", bar_size="1 min"):
+        with self.counter_lock:
+            req_id = self.request_id_counter + 6000
+            self.request_id_counter += 1
+        x = self.ib_broker.get_option_ohlc(symbol, expiry, strike, right, duration, bar_size, req_id)
+        return pd.DataFrame(x)
 
 class StrategyManager:
     def __init__(self):
@@ -84,66 +113,65 @@ class StrategyManager:
         self.keep_running = True
 
     def run(self):
-        self.collection_thread = threading.Thread(target=self.collect_option_ticks)
-        self.collection_thread.start()
+        # self.collection_thread = threading.Thread(target=self.collect_option_ticks)
+        # self.collection_thread.start()
         self.strategy.run()
     
-    def collect_option_ticks(self):
-        symbol = "SPX"
-        expiry = "20251212"
+    # def collect_option_ticks(self):
+    #     # To be added to creds.json
+    #     symbol = "SPX"
+    #     expiry = "20251212"
 
-        call_strike = 6800
-        put_strike = 6800
+    #     call_strike = 6800
+    #     put_strike = 6800
 
-        while self.keep_running:
-            # GET CALL DATA
-            try:
-                call_data = self.broker.get_option_tick(symbol, expiry, call_strike, "C")
-                put_data  = self.broker.get_option_tick(symbol, expiry, put_strike, "P")
+    #     while self.keep_running:
+    #         # GET CALL DATA
+    #         try:
+    #             call_data = self.broker.get_option_tick(symbol, expiry, call_strike, "C")
+    #             put_data  = self.broker.get_option_tick(symbol, expiry, put_strike, "P")
                 
-                if call_data is None or put_data is None:
-                    print("Option tick returned None — retrying...")
-                    continue
+    #             if call_data is None or put_data is None:
+    #                 print("Option tick returned None — retrying...")
+    #                 continue
 
-                if call_data.get("bid") is None or call_data.get("ask") is None:
-                    print("Call data incomplete — retrying...")
-                    continue
+    #             if call_data.get("bid") is None or call_data.get("ask") is None:
+    #                 print("Call data incomplete — retrying...")
+    #                 continue
 
-                if put_data.get("bid") is None or put_data.get("ask") is None:
-                    print("Put data incomplete — retrying...")
-                    continue
-            except Exception as e:
-                print(f"Error getting option tick: {e}")
-                continue
+    #             if put_data.get("bid") is None or put_data.get("ask") is None:
+    #                 print("Put data incomplete — retrying...")
+    #                 continue
+    #         except Exception as e:
+    #             print(f"Error getting option tick: {e}")
+    #             continue
 
 
-            timestamp = datetime.now(pytz.timezone('US/Eastern')).isoformat()
+    #         timestamp = datetime.now(pytz.timezone('US/Eastern')).isoformat()
 
-            # store call
-            self.db.insert_tick({
-                "timestamp": timestamp,
-                "symbol": symbol,
-                "expiry": expiry,
-                "strike": call_strike,
-                "right": "C",
-                **call_data,
-                "mid": None if call_data["bid"] is None else (call_data["bid"] + call_data["ask"]) / 2
-            })
+    #         # store call
+    #         self.db.insert_tick({
+    #             "timestamp": timestamp,
+    #             "symbol": symbol,
+    #             "expiry": expiry,
+    #             "strike": call_strike,
+    #             "right": "C",
+    #             **call_data,
+    #             "mid": None if call_data["bid"] is None else (call_data["bid"] + call_data["ask"]) / 2
+    #         })
 
-            # store put
-            self.db.insert_tick({
-                "timestamp": timestamp,
-                "symbol": symbol,
-                "expiry": expiry,
-                "strike": put_strike,
-                "right": "P",
-                **put_data,
-                "mid": None if put_data["bid"] is None else (put_data["bid"] + put_data["ask"]) / 2
-            })
+    #         # store put
+    #         self.db.insert_tick({
+    #             "timestamp": timestamp,
+    #             "symbol": symbol,
+    #             "expiry": expiry,
+    #             "strike": put_strike,
+    #             "right": "P",
+    #             **put_data,
+    #             "mid": None if put_data["bid"] is None else (put_data["bid"] + put_data["ask"]) / 2
+    #         })
 
-            time.sleep(1)   # 0.5 second collection interval
 
 if __name__ == "__main__":
-    
     manager = StrategyManager()
     manager.run()
