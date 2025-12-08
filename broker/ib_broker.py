@@ -35,23 +35,44 @@ class IBBroker(EWrapper, EClient):
         self.connected = True
         print("Connected to IBKR")
 
+    # def tickPrice(self, reqId, tickType, price, attrib):
+    #     with self.lock:
+    #         if reqId not in self.prices:
+    #             self.prices[reqId] = {"bid": None, "ask": None, "mid": []}
+
+    #         if tickType == 1:  # bid
+    #             self.prices[reqId]["bid"] = price
+    #         elif tickType == 2:  # ask
+    #             self.prices[reqId]["ask"] = price
+
+    #         bid = self.prices[reqId]["bid"]
+    #         ask = self.prices[reqId]["ask"]
+
+    #         if bid and ask:
+    #             mid = (bid + ask) / 2
+    #             self.prices[reqId]["mid"].append(mid)
+
     def tickPrice(self, reqId, tickType, price, attrib):
+
         with self.lock:
             if reqId not in self.prices:
-                self.prices[reqId] = {"bid": None, "ask": None, "mid": []}
+                self.prices[reqId] = {"bid": None, "ask": None, "last": None}
 
-            if tickType == 1:  # bid
+            if tickType == 1:  # BID
                 self.prices[reqId]["bid"] = price
-            elif tickType == 2:  # ask
+
+            elif tickType == 2:  # ASK
                 self.prices[reqId]["ask"] = price
 
-            bid = self.prices[reqId]["bid"]
-            ask = self.prices[reqId]["ask"]
+            elif tickType == 4:  # LAST (rarely present for SPX)
+                self.prices[reqId]["last"] = price
 
-            if bid and ask:
-                mid = (bid + ask) / 2
-                self.prices[reqId]["mid"].append(mid)
+            elif tickType == 9:  # CLOSE PRICE → SPX index real-time value
+                self.prices[reqId]["last"] = price
 
+            if self.prices[reqId]["bid"] and self.prices[reqId]["ask"]:
+                mid = (self.prices[reqId]["bid"] + self.prices[reqId]["ask"]    ) / 2
+                self.prices[reqId]["mid"] = mid
 
     def historicalData(self, reqId, bar):
         with self.lock:
@@ -328,7 +349,7 @@ class IBBroker(EWrapper, EClient):
                 return next_id
             return None
 
-    def get_index_spot(self, symbol, exchange="CBOE", reqId=9001):
+    def get_index_spot(self, symbol, reqId, exchange="CBOE"):
         """
         Returns the real-time index price using IB API (raw ibapi, not ib_insync).
         """
@@ -338,15 +359,16 @@ class IBBroker(EWrapper, EClient):
 
             # Request market data
             self.reqMktData(reqId, contract, "", False, False, [])
-            print(reqId)
             # Wait for price to arrive
             for _ in range(20):   # wait up to ~5 seconds
                 time.sleep(0.25)
                 with self.lock:
                     if reqId in self.prices:
-                        price = self.prices[reqId]
-                        self.cancelMktData(reqId)
-                        return price
+                        last = self.prices[reqId].get("last")
+                        if last:
+                            self.cancelMktData(reqId)
+                            return last
+            # print("IB ERROR:", reqId, errorCode, errorString)
 
             # After timeout
             self.cancelMktData(reqId)
