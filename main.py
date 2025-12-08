@@ -37,7 +37,7 @@ class Strategy:
 
         # # Filter between 09:30 and 16:00
         # x_filtered = x[
-        #     (x["time"].dt.time >= time(9, 30)) &
+        #     (x["time"].dt.time >= time(9, 30)) &Y
         #     (x["time"].dt.time <= time(16, 0))
         # ]
 
