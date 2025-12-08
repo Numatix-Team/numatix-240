@@ -24,6 +24,28 @@ class IBBroker(EWrapper, EClient):
         # Set minimum API version to support fractional shares (version 163+)
         self.minVersion = 163
 
+
+
+    def create_contract(self, symbol, secType="STK", exchange="SMART", currency="USD",
+                    expiry=None, strike=None, right=None):
+        """
+        Universal contract creator for stocks, indices, and options.
+        StrategyBroker depends on this method.
+        """
+        c = Contract()
+        c.symbol = symbol
+        c.secType = secType
+        c.exchange = exchange
+        c.currency = currency
+
+        if secType == "OPT":
+            c.lastTradeDateOrContractMonth = expiry
+            c.strike = float(strike)
+            c.right = right
+            c.multiplier = "100"
+
+        return c
+
     def connect_to_ibkr(self, host="127.0.0.1", port=7497, client_id=1):
         """Connect to IBKR"""
         self.connect(host, port, client_id)

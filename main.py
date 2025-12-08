@@ -7,6 +7,8 @@ from db.db_logger import OptionDBLogger
 import time
 from datetime import datetime, time
 import pytz
+from log import setup_logger
+setup_logger()
 
 class Strategy:
     def __init__(self,manager, broker, config_path="config.json"):
