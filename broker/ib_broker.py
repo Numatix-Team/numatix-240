@@ -142,7 +142,7 @@ class IBBroker(EWrapper, EClient):
             self.next_valid_id = orderId
             print(f"Next valid order ID from IBKR: {orderId}")
 
-    def error(self, reqId, errorCode, errorString):
+    def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=""):
         """Error callback - filter out common non-critical messages"""
         # Filter out common connection status messages that are not actual errors
         ignore_codes = {
@@ -461,12 +461,12 @@ class IBBroker(EWrapper, EClient):
         # request option data + greeks
         self.reqMktData(req_id, contract, "100,101", False, False, [])
 
-        # timeout = 20
-        # for _ in range(timeout):
-        #     time.sleep(0.1)
-        #     with self.lock:
-        #         if req_id in self.prices:
-        #             break
+        timeout = 20
+        for _ in range(timeout):
+            time.sleep(0.1)
+            with self.lock:
+                if req_id in self.prices:
+                    break
 
         ticker = self.prices.get(req_id, {})
         self.cancelMktData(req_id)

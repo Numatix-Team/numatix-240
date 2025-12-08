@@ -26,7 +26,7 @@
         "entry_start": "09:30",
         "entry_end": "14:30",
         "force_exit_time": "15:10",
-        "timezone": "America/New_York"
+        "timezone": "US/Eastern"
     },
     "hedging": {
         "enable_hedges": true,
