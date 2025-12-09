@@ -1,4 +1,3 @@
-# helpers.py
 import json
 import os
 import threading
@@ -69,13 +68,11 @@ def generate_position_id(symbol, strike, right, tz):
 
 def create_position_entry(
     symbol, expiry, strike, right, side, qty,
-    bid, ask, order_id, position_type, tz
+    entry_price, order_id, position_type, tz, bid=0, ask=0
 ):
     data = load_positions_file()
     pos_id = generate_position_id(symbol, strike, right, tz)
     now = datetime.now(tz).isoformat()
-
-    entry_price = derive_fill_price(bid, ask, side)
 
     pos = {
         "id": pos_id,
@@ -93,8 +90,8 @@ def create_position_entry(
         "exit_time": None,
 
         "entry_price": entry_price,
-        "entry_bid": bid,
-        "entry_ask": ask,
+        "bid": bid,
+        "ask": ask,
         "last_price": entry_price,
         "close_price": None,
         "pnl_pct": 0.0,
@@ -136,17 +133,6 @@ def update_position_in_json(updated_pos):
     positions.append(updated_pos)
     data["positions"] = positions
     save_positions_file(data)
-
-
-# =========================================================
-# PRICE UTILITY
-# =========================================================
-
-def derive_fill_price(bid, ask, side):
-    """Pick correct fill price for buy/sell."""
-    if side == "BUY":
-        return ask if ask is not None else bid
-    return bid if bid is not None else ask
 
 
 def simulated_bid_ask(base_price):
