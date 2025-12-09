@@ -466,6 +466,37 @@ class Strategy:
 
         print("\n========== TEST COMPLETE ==========\n")
 
+    def run(self, poll_interval=1):
+        print("[Strategy] RUN LOOP STARTED")
+
+        while self.manager.keep_running:
+
+            # If a position is open → manage it
+            if self.position_open:
+                self.manage_positions(poll_interval)
+                time_mod.sleep(poll_interval)
+                continue
+            
+            self.load_config(self.config_path)
+            # No position → fetch market data
+            if not self.fetch_data():
+                time_mod.sleep(poll_interval)
+                continue
+
+            # Calculate VWAP
+            if not self.calculate_indicators():
+                time_mod.sleep(poll_interval)
+                continue
+
+            # Generate signal
+            signal = self.generate_signals()
+
+            if signal["action"] == "SELL_STRADDLE":
+                self.execute_trade(signal)
+                continue
+
+            time_mod.sleep(poll_interval)
+
 
 # BROKER WRAPPER
 class StrategyBroker:
