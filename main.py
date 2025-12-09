@@ -24,8 +24,6 @@ class Strategy:
     Position-handling logic is delegated to helpers.py.
     """
 
-    SPX_STRIKE_STEP = 5   # SPX uses 5-point intervals
-
     def __init__(self, manager, broker, config_path="config.json"):
         """Initialize state, load config, restore previous open positions."""
         self.manager = manager
