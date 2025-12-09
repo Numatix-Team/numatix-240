@@ -20,7 +20,8 @@
         "entry_vwap_multiplier": 0.99,
         "take_profit": 0.3,
         "stop_loss": 0.3,
-        "max_bid_ask_spread": 1.05
+        "max_bid_ask_spread": 1.05,
+        "strike_step": 5
     },
     "time_controls": {
         "entry_start": "09:30",
