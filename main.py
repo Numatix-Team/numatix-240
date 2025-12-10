@@ -3,12 +3,15 @@ import json
 import time
 import random
 import threading
-from datetime import datetime, time
+from datetime import datetime, time as dt_time
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, Optional
 import pandas as pd
 import pytz
 import numpy as np
 import time as time_mod
+import csv
+from pathlib import Path
 
 from broker.ib_broker import IBBroker
 from log import setup_logger
@@ -103,12 +106,19 @@ class Strategy:
             }
 
     # FETCH MARKET DATA
+   
     def fetch_data(self):
+        # -------------------------------
+        # 1) Fetch spot price
+        # -------------------------------
         spot = self.broker.current_price(self.symbol, self.exchange)
         if spot is None:
             print("[Strategy] Spot unavailable.")
             return False
 
+        # -------------------------------
+        # 2) Compute strikes
+        # -------------------------------
         atm = round(spot / self.strike_step) * self.strike_step
         self.atm = atm
         self.call_strike = atm + self.atm_call_offset * self.strike_step
@@ -120,6 +130,9 @@ class Strategy:
 
         print(f"[Strategy] ATM={atm}, CALL={self.call_strike}, PUT={self.put_strike}")
 
+        # -------------------------------
+        # 3) Fetch OHLC data for call & put
+        # -------------------------------
         c_ohlc = self.broker.get_option_ohlc(self.symbol, self.expiry, self.call_strike, "C")
         p_ohlc = self.broker.get_option_ohlc(self.symbol, self.expiry, self.put_strike, "P")
 
@@ -127,27 +140,30 @@ class Strategy:
             print("[Strategy] Missing OHLC")
             return False
 
-        c_ohlc["time"] = c_ohlc["time"].apply(lambda x: parse_ib_datetime(x, self.tz))
-        p_ohlc["time"] = p_ohlc["time"].apply(lambda x: parse_ib_datetime(x, self.tz))
-
+        # -------------------------------
+        # 5) Merge call & put on timestamp
+        # -------------------------------
         df = c_ohlc.merge(p_ohlc, on="time", suffixes=("_call", "_put"))
 
-        today = datetime.now(self.tz).date()
-        market_open = datetime.now(self.tz).replace(hour=9, minute=30, second=0, microsecond=0)
-
-        df = df[df["time"].dt.date == today]
-        df = df[df["time"] >= market_open]
-
         if df.empty:
+            print("[Strategy] No OHLC data inside market hours.")
             return False
 
+        # -------------------------------
+        # 8) Compute combined premium + combined volume
+        # -------------------------------
         df["combined_premium"] = df["close_call"] + df["close_put"]
         df["combined_volume"] = df["volume_call"] + df["volume_put"]
+
         df = df[df["combined_volume"] > 0]
 
         if df.empty:
+            print("[Strategy] All OHLC bars had zero volume.")
             return False
 
+        # -------------------------------
+        # 9) Save final dataframe
+        # -------------------------------
         self.hist_df = df
         return True
 
@@ -219,7 +235,7 @@ class Strategy:
 
         # ATM CALL
         c = self.broker.place_option_market_order(
-            self.symbol, self.expiry, self.call_strike, "C", self.call_qty, "SELL"
+            self.symbol, self.expiry, self.call_strike, "C", self.call_qty, "SELL", self.exchange
         )
         fill_call = c["fill_price"]
 
@@ -232,7 +248,7 @@ class Strategy:
 
         # ATM PUT
         p = self.broker.place_option_market_order(
-            self.symbol, self.expiry, self.put_strike, "P", self.put_qty, "SELL"
+            self.symbol, self.expiry, self.put_strike, "P", self.put_qty, "SELL", self.exchange
         )
         fill_put = p["fill_price"]
 
@@ -247,7 +263,7 @@ class Strategy:
         if self.enable_hedges:
 
             hc = self.broker.place_option_market_order(
-                self.symbol, self.expiry, self.hedge_call_strike, "C", self.hedge_qty, "BUY"
+                self.symbol, self.expiry, self.hedge_call_strike, "C", self.hedge_qty, "BUY", self.exchange
             )
             fill_hc = hc["fill_price"]
 
@@ -259,7 +275,7 @@ class Strategy:
             )
 
             hp = self.broker.place_option_market_order(
-                self.symbol, self.expiry, self.hedge_put_strike, "P", self.hedge_qty, "BUY"
+                self.symbol, self.expiry, self.hedge_put_strike, "P", self.hedge_qty, "BUY", self.exchange
             )
             fill_hp = hp["fill_price"]
 
@@ -366,13 +382,13 @@ class Strategy:
 
         if self.atm_call_id:
             resp = self.broker.place_option_market_order(
-                self.symbol, self.expiry, self.call_strike, "C", self.call_qty, "BUY"
+                self.symbol, self.expiry, self.call_strike, "C", self.call_qty, "BUY", self.exchange
             )
             self._close_leg(self.atm_call_id, resp)
 
         if self.atm_put_id:
             resp = self.broker.place_option_market_order(
-                self.symbol, self.expiry, self.put_strike, "P", self.put_qty, "BUY"
+                self.symbol, self.expiry, self.put_strike, "P", self.put_qty, "BUY", self.exchange
             )
             self._close_leg(self.atm_put_id, resp)
 
@@ -380,13 +396,13 @@ class Strategy:
 
             if self.otm_call_id:
                 resp = self.broker.place_option_market_order(
-                    self.symbol, self.expiry, self.hedge_call_strike, "C", self.hedge_qty, "SELL"
+                    self.symbol, self.expiry, self.hedge_call_strike, "C", self.hedge_qty, "SELL", self.exchange
                 )
                 self._close_leg(self.otm_call_id, resp)
 
             if self.otm_put_id:
                 resp = self.broker.place_option_market_order(
-                    self.symbol, self.expiry, self.hedge_put_strike, "P", self.hedge_qty, "SELL"
+                    self.symbol, self.expiry, self.hedge_put_strike, "P", self.hedge_qty, "SELL", self.exchange
                 )
                 self._close_leg(self.otm_put_id, resp)
 
@@ -433,19 +449,19 @@ class Strategy:
     def test_place_and_exit_only_atm(self):
         print("\n========== TEST MODE ==========\n")
 
-        call = self.broker.place_option_market_order(self.symbol, self.expiry, 6800, "C", 10, "SELL")
-        put = self.broker.place_option_market_order(self.symbol, self.expiry, 6800, "P", 10, "SELL")
+        call = self.broker.place_option_market_order(self.symbol, self.expiry, 684, "C", 1, "SELL", self.exchange)
+        put = self.broker.place_option_market_order(self.symbol, self.expiry, 684, "P", 1, "SELL", self.exchange)
 
         entry_call = call["fill_price"]
         entry_put = put["fill_price"]
 
         self.atm_call_id = create_position_entry(
-            self.symbol, self.expiry, 6800, "C",
+            self.symbol, self.expiry, 684, "C",
             "SELL", 10, entry_call, call["order_id"], "ATM", self.tz
         )
 
         self.atm_put_id = create_position_entry(
-            self.symbol, self.expiry, 6800, "P",
+            self.symbol, self.expiry, 684, "P",
             "SELL", 10, entry_put, put["order_id"], "ATM", self.tz
         )
 
@@ -458,8 +474,8 @@ class Strategy:
             print(f"Updated {i+1}/10")
             time_mod.sleep(1)
 
-        call_exit = self.broker.place_option_market_order(self.symbol, self.expiry, 6800, "C", 10, "BUY")
-        put_exit = self.broker.place_option_market_order(self.symbol, self.expiry, 6800, "P", 10, "BUY")
+        call_exit = self.broker.place_option_market_order(self.symbol, self.expiry, 684, "C", 10, "BUY", self.exchange)
+        put_exit = self.broker.place_option_market_order(self.symbol, self.expiry, 684, "P", 10, "BUY", self.exchange)
 
         self._close_leg(self.atm_call_id, call_exit)
         self._close_leg(self.atm_put_id, put_exit)
@@ -496,9 +512,37 @@ class Strategy:
                 continue
 
             time_mod.sleep(poll_interval)
+    def log_signal(self, action, combined):
+        """Save each signal to a daily CSV file."""
+
+        # Create signals folder if missing
+        Path("signals").mkdir(exist_ok=True)
+
+        # Use date-based filename
+        date_str = datetime.now(self.tz).strftime("%Y-%m-%d")
+        file_path = f"signals/{date_str}_signals.csv"
+
+        # Check if file exists (to write header only once)
+        file_exists = os.path.isfile(file_path)
+
+        with open(file_path, "a", newline="") as f:
+            writer = csv.writer(f)
+
+            # Write header if new file
+            if not file_exists:
+                writer.writerow(["timestamp", "action", "combined", "call_strike",
+                                "put_strike", "vwap"])
+
+            writer.writerow([
+                datetime.now(self.tz).isoformat(),
+                action,
+                combined if combined is not None else "",
+                self.call_strike,
+                self.put_strike,
+                self.vwap
+            ])
 
 
-# BROKER WRAPPER
 class StrategyBroker:
     def __init__(self, config_path="config.json"):
         with open(config_path, "r") as f:
@@ -549,14 +593,23 @@ class StrategyBroker:
         x = self.ib_broker.get_option_ohlc(symbol, expiry, strike, right, duration, bar_size, req_id)
         return pd.DataFrame(x)
 
-    def place_option_market_order(self, symbol, expiry, strike, right, qty, action):
+    def place_option_market_order(self, symbol, expiry, strike, right, qty, action, exchange):
         print(f"[BROKER] MARKET ORDER → {action} {qty}x {symbol} {expiry} {strike}{right}")
 
-        # REAL LOGIC WILL COME FROM IBKR FILLS
-        fill_price = np.round(np.random.uniform(1.0, 50.0), 2)
-        order_id = f"SIM_{int(time.time()*1000)}"
+        # Get orderId directly from IBKR
+        with self.counter_lock:
+            req_id = req_id = self.get_next_available_order_id()
 
-        return {"fill_price": fill_price, "order_id": order_id}
+        # place the order
+        order_id, fill_price = self.ib_broker.place_market_option_order(
+            symbol, exchange, expiry, strike, right, action, qty, req_id
+        )
+
+        return {
+            "order_id": order_id,
+            "fill_price": fill_price
+        }
+
 
 
 # STRATEGY MANAGER
@@ -567,7 +620,8 @@ class StrategyManager:
         self.keep_running = True
 
     def run(self):
-        self.strategy.test_place_and_exit_only_atm()
+        self.strategy.run()
+        
 
 
 if __name__ == "__main__":

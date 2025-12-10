@@ -499,7 +499,7 @@ class IBBroker(EWrapper, EClient):
             duration,            # how far back
             bar_size,            # candle size
             "TRADES",            # data type
-            0,                   # useRTH=0 => include pre/post market
+            1,                   # useRTH=0 => include pre/post market
             1,                   # formatDate=1 => string dates
             False,               # keepUpToDate
             []
@@ -526,3 +526,71 @@ class IBBroker(EWrapper, EClient):
         ]
 
         return ohlc
+    
+    def place_market_option_order(self, symbol, exchange, expiry, strike, right, action, quantity, reqid):
+        contract = Contract()
+        contract.symbol = symbol
+        contract.secType = "OPT"
+        contract.exchange = exchange
+        contract.currency = "USD"
+        contract.lastTradeDateOrContractMonth = expiry
+        contract.strike = float(strike)
+        contract.right = right
+
+        order = Order()
+        order.action = action 
+        order.totalQuantity = abs(int(quantity))
+        order.orderType = "MKT"
+        order.eTradeOnly = False
+        order.firmQuoteOnly = False
+
+        print(f"[IBAPI] Placing OPTION order → {order.action} {abs(quantity)} {symbol} {right} {strike} exp:{expiry}")
+
+        try:
+            self.placeOrder(reqid, contract, order)
+            print(f"[IBAPI] Order submitted. OrderId = {reqid}")
+        except Exception as e:
+            print(f"[IBAPI ERROR] Failed to place option order: {e}")
+            return None, None
+
+        timeout = 20
+        waited = 0
+
+        while waited < timeout:
+            time.sleep(0.2)
+            waited += 0.2
+
+            with self.lock:
+                status_data = self.order_status.get(reqid, {})
+                status = status_data.get("status")
+                fill_price = status_data.get("avgFillPrice")
+
+                if status == "Filled":
+                    print(f"[IBAPI] Order Filled → Price: {fill_price}")
+                    return reqid, fill_price
+
+                if fill_price not in [None, 0]:
+                    print(f"[IBAPI] Partial Fill → Price: {fill_price}")
+                    return reqid, fill_price
+
+        print(f"[IBAPI] Order not filled in 20s → Cancelling OrderId {reqid}")
+        try:
+            self.cancelOrder(reqid)
+        except:
+            pass
+
+        time.sleep(1)
+
+        with self.lock:
+            status_data = self.order_status.get(reqid, {})
+            fill_price = status_data.get("avgFillPrice", None)
+
+            if fill_price not in [None, 0]:
+                print(f"[IBAPI] Received late partial fill → Price: {fill_price}")
+                return reqid, fill_price
+
+        print(f"[IBAPI] Order cancelled with NO fills.")
+        return reqid, None
+
+            
+

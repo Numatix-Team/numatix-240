@@ -6,7 +6,7 @@
     },
     "underlying": {
         "symbol": "SPX",
-        "exchange": "SMART",
+        "exchange": "MART",
         "currency": "USD"
     },
     "expiry": {
@@ -31,8 +31,8 @@
     },
     "hedging": {
         "enable_hedges": true,
-        "hedge_call_offset": 10,
-        "hedge_put_offset": 10,
+        "hedge_call_offset": 1,
+        "hedge_put_offset": 1,
         "hedge_quantity": 1
     }
 }
