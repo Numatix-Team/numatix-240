@@ -506,7 +506,7 @@ class IBBroker(EWrapper, EClient):
         )
 
         # Wait until data arrives
-        timeout = 20
+        timeout = 50
         for _ in range(timeout):
             time.sleep(0.1)
             if req_id in self.historical_data:
@@ -527,7 +527,7 @@ class IBBroker(EWrapper, EClient):
 
         return ohlc
     
-    def place_market_option_order(self, symbol, exchange, expiry, strike, right, action, quantity, reqid):
+    def place_market_option_order(self, symbol, exchange, expiry, strike, right, action, quantity, reqid, wait_until_filled=False):
         contract = Contract()
         contract.symbol = symbol
         contract.secType = "OPT"
@@ -553,10 +553,10 @@ class IBBroker(EWrapper, EClient):
             print(f"[IBAPI ERROR] Failed to place option order: {e}")
             return None, None
 
-        timeout = 20
+        timeout = 20  # seconds
         waited = 0
 
-        while waited < timeout:
+        while True:
             time.sleep(0.2)
             waited += 0.2
 
@@ -571,16 +571,23 @@ class IBBroker(EWrapper, EClient):
 
                 if fill_price not in [None, 0]:
                     print(f"[IBAPI] Partial Fill → Price: {fill_price}")
-                    return reqid, fill_price
+                    if not wait_until_filled:
+                        return reqid, fill_price
+                    # If waiting indefinitely → keep waiting
 
-        print(f"[IBAPI] Order not filled in 20s → Cancelling OrderId {reqid}")
-        try:
-            self.cancelOrder(reqid)
-        except:
-            pass
+            # ---- TIMEOUT MODE ----
+            if not wait_until_filled and waited >= timeout:
+                print(f"[IBAPI] Order not filled in {timeout}s → Cancelling OrderId {reqid}")
+                try:
+                    self.cancelOrder(reqid)
+                except:
+                    pass
+                break  # exit wait loop
 
+        # ---------------------------------------------
+        # AFTER TIMEOUT → CHECK FOR LATE PARTIAL FILLS
+        # ---------------------------------------------
         time.sleep(1)
-
         with self.lock:
             status_data = self.order_status.get(reqid, {})
             fill_price = status_data.get("avgFillPrice", None)

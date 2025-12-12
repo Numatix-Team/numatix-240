@@ -117,24 +117,6 @@ def get_position_by_id(pos_id):
     return None
 
 
-def update_position_in_json(updated_pos):
-    if updated_pos is None:
-        return
-    data = load_positions_file()
-    positions = data.get("positions", [])
-
-    for i, pos in enumerate(positions):
-        if pos["id"] == updated_pos["id"]:
-            positions[i] = updated_pos
-            data["positions"] = positions
-            save_positions_file(data)
-            return
-
-    positions.append(updated_pos)
-    data["positions"] = positions
-    save_positions_file(data)
-
-
 def simulated_bid_ask(base_price):
     """Used only for _update_live_leg simulation."""
     bid = base_price + random.uniform(-2, 2)
@@ -161,3 +143,56 @@ def save_active_ids(position_open, atm_call_id, atm_put_id, otm_call_id, otm_put
         "otm_put_id": otm_put_id
     }
     save_positions_file(data)
+
+def update_position_in_json(updated_pos):
+    if updated_pos is None:
+        return
+
+    data = load_positions_file()
+    positions = data.get("positions", [])
+
+    updated_id = str(updated_pos["id"])
+    replaced = False
+
+    # ---------------------------------------
+    # Replace matching position by ID
+    # ---------------------------------------
+    for i, pos in enumerate(positions):
+        if str(pos["id"]) == updated_id:
+            positions[i] = updated_pos
+            replaced = True
+            break
+
+    if not replaced:
+        positions.append(updated_pos)
+
+    data["positions"] = positions
+
+    # ---------------------------------------
+    # Compute TOTAL REALIZED + UNREALIZED PnL
+    # ---------------------------------------
+    total_realized = 0.0
+    total_unrealized = 0.0
+
+    for pos in positions:
+        pnl_val = pos.get("pnl_value", 0) or 0
+
+        if pos.get("active"):
+            total_unrealized += pnl_val
+        else:
+            total_realized += pnl_val
+
+    total_combined = total_realized + total_unrealized
+
+    # ---------------------------------------
+    # Store totals in JSON
+    # ---------------------------------------
+    data["summary"] = {
+        "total_realized_pnl": round(total_realized, 2),
+        "total_unrealized_pnl": round(total_unrealized, 2),
+        "total_combined_pnl": round(total_combined, 2),
+        "last_update": datetime.now().isoformat()
+    }
+
+    save_positions_file(data)
+
