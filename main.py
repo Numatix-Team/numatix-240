@@ -4,7 +4,6 @@ import time
 import random
 import threading
 from datetime import datetime, time as dt_time
-from zoneinfo import ZoneInfo
 from typing import Any, Dict, Optional
 import pandas as pd
 import pytz
@@ -200,42 +199,37 @@ class Strategy:
     #generates signals 
     def generate_signals(self):
         now = datetime.now(self.tz).time()
-
-        # Block entry before market open
-        if now < self.entry_start:
+        if not (self.entry_start <= now <= self.entry_end):
             return {"action": "NONE"}
-
-        # Block entry after entry window
-        if now > self.entry_end:
-            return {"action": "BLOCKED_TIME"}
 
         cp = self.broker.get_option_premium(self.symbol, self.expiry, self.call_strike, "C")
         pp = self.broker.get_option_premium(self.symbol, self.expiry, self.put_strike, "P")
 
         c_price = self._extract_price(cp)
         p_price = self._extract_price(pp)
+        print(c_price,p_price)
 
         if c_price is None or p_price is None:
+            self.log_signal("NONE", None)
             return {"action": "NONE"}
 
         combined = c_price + p_price
+        print(combined)
 
-        # Log every signal check
-        self.log_signal("CHECK", combined)
-
-        # Spread check
-        if self._spread(cp) is None or self._spread(pp) is None:
-            return {"action": "NONE"}
-
-        if self._spread(cp) > self.max_spread or self._spread(pp) > self.max_spread:
+        if any([
+            self._spread(cp) is None,
+            self._spread(pp) is None,
+            self._spread(cp) > self.max_spread,
+            self._spread(pp) > self.max_spread
+        ]):
             return {"action": "NONE"}
 
         threshold = self.vwap * self.entry_vwap_mult
 
         if not self.position_open and combined < threshold:
-            self.log_signal("SELL_STRADDLE", combined)
             return {"action": "SELL_STRADDLE", "combined": combined}
 
+        self.log_signal("NONE", combined)
         return {"action": "NONE"}
 
     # ORDER EXECUTION
@@ -585,8 +579,7 @@ class Strategy:
             
             print(f"Sigal generated: {signal}")
 
-            # if signal["action"] == "SELL_STRADDLE":
-            if True:
+            if signal["action"] == "SELL_STRADDLE":
                 self.execute_trade(signal)
                 continue
             print(f"Sleeping for {poll_interval}")
