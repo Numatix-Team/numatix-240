@@ -10,7 +10,7 @@
         "currency": "USD"
     },
     "expiry": {
-        "date": "20251212"
+        "date": "20251216"
     },
     "trade_parameters": {
         "call_quantity": 5,
@@ -19,7 +19,20 @@
         "atm_put_offset": 1,
         "entry_vwap_multiplier": 0.99,
         "exit_vwap_multiplier": 1.02,
-        "take_profit": 0.3,
+        "take_profit_levels": [
+            {
+                "pnl_percent": 0.3,
+                "exit_percent": 0.5
+            },
+            {
+                "pnl_percent": 0.4,
+                "exit_percent": 0.3
+            },
+            {
+                "pnl_percent": 0.5,
+                "exit_percent": 0.2
+            }
+        ],
         "stop_loss": 0.3,
         "max_bid_ask_spread": 1.05,
         "strike_step": 1
@@ -31,9 +44,11 @@
         "timezone": "US/Eastern"
     },
     "hedging": {
-        "enable_hedges": false,
+        "enable_hedges": true,
         "hedge_call_offset": 3,
         "hedge_put_offset": 3,
         "hedge_quantity": 1
-    }
+    },
+    "paused": false,
+    "stopped": true
 }

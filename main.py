@@ -11,20 +11,63 @@ import numpy as np
 import time as time_mod
 import csv
 from pathlib import Path
-
+import argparse
 from broker.ib_broker import IBBroker
 from log import setup_logger
 from helpers.positions import *
+from db.position_db import PositionDB
 
 setup_logger()
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--account",
+        type=str,
+        default="default",
+        help="Account identifier"
+    )
+
+    parser.add_argument(
+        "--symbol",
+        type=str,
+        default=None,
+        help="Override trading symbol"
+    )
+
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="config.json",
+        help="Path to config file"
+    )
+
+    parser.add_argument(
+        "--range",
+        type=str,
+        default=None,
+        help="Strike range as 'start:end' (e.g., '-2:2' for offsets -2 to 2)"
+    )
+
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Run in test mode (executes test function in main thread only)"
+    )
+
+    return parser.parse_args()
 
 
 class Strategy:
 
-    def __init__(self, manager, broker, config_path="config.json"):
+    def __init__(self, manager, broker, account, config_path="config.json", strike_offset=0, base_atm_price=None):
         self.manager = manager
         self.broker = broker
         self.config_path = config_path
+        self.account = account
+        self.strike_offset = strike_offset  # n value: strike = ATM + n
+        self.base_atm_price = base_atm_price  # Base ATM price from broker
 
         # runtime active IDs
         self.atm_call_id = None
@@ -45,8 +88,7 @@ class Strategy:
         self.vwap = None
         self.hist_df = pd.DataFrame()
 
-        if not os.path.exists("positions.json"):
-            save_positions_file({"positions": [], "active_positions": {"position_open": False}})
+        # Database is initialized automatically, no need to create JSON file
 
         self._load_active_ids()
 
@@ -68,7 +110,13 @@ class Strategy:
         self.atm_put_offset = tp["atm_put_offset"]
         self.entry_vwap_mult = tp["entry_vwap_multiplier"]
         self.exit_vwap_mult = tp["exit_vwap_multiplier"]
-        self.tp_pct = tp["take_profit"]
+        self.tp_levels = []
+        for level in tp.get("take_profit_levels", []):
+            self.tp_levels.append({
+                "pnl": float(level["pnl_percent"]),
+                "exit_frac": float(level["exit_percent"]),
+                "done": False
+            })
         self.sl_pct = tp["stop_loss"]
         self.max_spread = tp["max_bid_ask_spread"]
         self.strike_step = tp["strike_step"]
@@ -87,9 +135,15 @@ class Strategy:
 
         print("[Strategy] Config reloaded.")
 
+        self.init_call_qty = self.call_qty
+        self.init_put_qty  = self.put_qty
+
+        self.curr_call_qty = self.call_qty
+        self.curr_put_qty  = self.put_qty   
+
     # RESTORE ACTIVE POSITIONS
     def _load_active_ids(self):
-        active = load_active_ids()
+        active = load_active_ids(self.account)
 
         self.position_open = active.get("position_open", False)
         self.atm_call_id = active.get("atm_call_id")
@@ -109,26 +163,35 @@ class Strategy:
    
     def fetch_data(self):
         # -------------------------------
-        # 1) Fetch spot price
+        # 1) Use provided base ATM price (already rounded in StrategyManager)
         # -------------------------------
-        spot = self.broker.current_price(self.symbol, self.exchange)
-        if spot is None:
-            print("[Strategy] Spot unavailable.")
-            return False
+        if self.base_atm_price is not None:
+            # base_atm_price is already rounded to nearest strike_step in StrategyManager
+            # Use it directly without re-rounding
+            atm = self.base_atm_price
+        else:
+            # Fallback: fetch from broker (for backward compatibility only)
+            spot = self.broker.current_price(self.symbol, self.exchange)
+            if spot is None:
+                print("[Strategy] Spot unavailable.")
+                return False
+            # Round to nearest strike step
+            atm = round(spot / self.strike_step) * self.strike_step
 
         # -------------------------------
-        # 2) Compute strikes
+        # 2) Compute strikes with offset
         # -------------------------------
-        atm = round(spot / self.strike_step) * self.strike_step
-        self.atm = atm
-        self.call_strike = atm + self.atm_call_offset * self.strike_step
-        self.put_strike = atm - self.atm_put_offset * self.strike_step
+        # Apply strike offset: strike = ATM + strike_offset
+        atm_with_offset = atm + self.strike_offset * self.strike_step
+        self.atm = atm_with_offset
+        self.call_strike = atm_with_offset + self.atm_call_offset * self.strike_step
+        self.put_strike = atm_with_offset - self.atm_put_offset * self.strike_step
 
         if self.enable_hedges:
-            self.hedge_call_strike = atm + self.hedge_call_offset * self.strike_step
-            self.hedge_put_strike = atm - self.hedge_put_offset * self.strike_step
+            self.hedge_call_strike = atm_with_offset + self.hedge_call_offset * self.strike_step
+            self.hedge_put_strike = atm_with_offset - self.hedge_put_offset * self.strike_step
 
-        print(f"[Strategy] ATM={atm}, CALL={self.call_strike}, PUT={self.put_strike}")
+        print(f"[Strategy] Offset={self.strike_offset}, Base_ATM={atm}, ATM={atm_with_offset}, CALL={self.call_strike}, PUT={self.put_strike}")
 
         # -------------------------------
         # 3) Fetch OHLC data for call & put
@@ -249,7 +312,7 @@ class Strategy:
                 return
 
             self.otm_call_id = create_position_entry(
-                self.symbol, self.expiry, self.hedge_call_strike, "C",
+                self.account, self.symbol, self.expiry, self.hedge_call_strike, "C",
                 "BUY", self.hedge_qty,
                 fill_hc, hc["order_id"], "OTM", self.tz,
                 bid=0, ask=0
@@ -264,7 +327,7 @@ class Strategy:
                 return
 
             self.otm_put_id = create_position_entry(
-                self.symbol, self.expiry, self.hedge_put_strike, "P",
+                self.account, self.symbol, self.expiry, self.hedge_put_strike, "P",
                 "BUY", self.hedge_qty,
                 fill_hp, hp["order_id"], "OTM", self.tz,
                 bid=0, ask=0
@@ -280,7 +343,7 @@ class Strategy:
             return
 
         self.atm_call_id = create_position_entry(
-            self.symbol, self.expiry, self.call_strike, "C",
+            self.account, self.symbol, self.expiry, self.call_strike, "C",
             "SELL", self.call_qty,
             fill_call, c["order_id"], "ATM", self.tz,
             bid=0, ask=0
@@ -296,7 +359,7 @@ class Strategy:
             return
 
         self.atm_put_id = create_position_entry(
-            self.symbol, self.expiry, self.put_strike, "P",
+            self.account, self.symbol, self.expiry, self.put_strike, "P",
             "SELL", self.put_qty,
             fill_put, p["order_id"], "ATM", self.tz,
             bid=0, ask=0
@@ -304,17 +367,26 @@ class Strategy:
 
         self.position_open = True
         save_active_ids(
-            True, self.atm_call_id, self.atm_put_id, self.otm_call_id, self.otm_put_id
+            True, self.atm_call_id, self.atm_put_id, self.otm_call_id, self.otm_put_id, self.account
         )
 
+        self.init_call_qty = self.call_qty
+        self.init_put_qty  = self.put_qty
+
+        self.curr_call_qty = self.call_qty
+        self.curr_put_qty  = self.put_qty
+        
+        for tp in self.tp_levels:
+            tp["done"] = False
+
     # LIVE UPDATES
-    def _update_live_leg(self, pos_id):
+    def _update_live_leg(self, pos_id, test_mode=False):
         pos = get_position_by_id(pos_id)
         if pos is None or not pos.get("active", False):
             return
 
         data = self.broker.get_option_premium(
-            pos["symbol"], pos["expiry"], pos["strike"], pos["right"]
+            pos["symbol"], pos["expiry"], pos["strike"], pos["right"], test_mode=test_mode
         )
 
         bid = data.get("bid")
@@ -329,24 +401,57 @@ class Strategy:
         qty = pos["qty"]
 
         # -----------------------------
-        # NEW: PNL VALUE INSTEAD OF %
+        # Calculate unrealized PnL
         # -----------------------------
         if pos["side"] == "SELL":
-            pnl_value = (entry - last_price) * qty
-            pnl_pct = (entry - last_price) / entry
+            unrealized_pnl = (entry - last_price) * qty
         else:
-            pnl_value = (last_price - entry) * qty
-            pnl_pct = (last_price - entry) / entry
+            unrealized_pnl = (last_price - entry) * qty
 
         pos["bid"] = bid
         pos["ask"] = ask
         pos["last_price"] = last_price
-        pos["pnl_value"] = pnl_value
-        pos["pnl_pct"] = pnl_pct  # still stored for reporting
+        pos["unrealized_pnl"] = unrealized_pnl
+        pos["realized_pnl"] = 0.0  # No realized PnL for active positions
         pos["last_update"] = datetime.now(self.tz).isoformat()
 
         update_position_in_json(pos)
 
+    def _partial_exit_atm(self, exit_fraction, reason):
+        print(f"[TP] Partial exit {exit_fraction*100:.0f}% → {reason}")
+
+        # Calculate exit qty from ORIGINAL qty
+        call_exit_qty = int(round(self.init_call_qty * exit_fraction))
+        put_exit_qty  = int(round(self.init_put_qty * exit_fraction))
+
+        # Cap by remaining qty
+        call_exit_qty = min(call_exit_qty, self.curr_call_qty)
+        put_exit_qty  = min(put_exit_qty, self.curr_put_qty)
+
+        if call_exit_qty <= 0 or put_exit_qty <= 0:
+            print("[TP] Nothing left to exit")
+            return
+
+        # ---- CALL ----
+        self.broker.place_option_market_order(
+            self.symbol, self.expiry, self.call_strike,
+            "C", call_exit_qty, "BUY", self.exchange, True
+        )
+
+        # ---- PUT ----
+        self.broker.place_option_market_order(
+            self.symbol, self.expiry, self.put_strike,
+            "P", put_exit_qty, "BUY", self.exchange, True
+        )
+
+        # Update CURRENT quantities
+        self.curr_call_qty -= call_exit_qty
+        self.curr_put_qty  -= put_exit_qty
+
+        print(
+            f"[TP] Remaining qty → CALL {self.curr_call_qty}, "
+            f"PUT {self.curr_put_qty}"
+        )
 
 
     # POSITION MANAGEMENT
@@ -381,9 +486,9 @@ class Strategy:
 
             pnl_pct = (entry_total - current) / entry_total
 
-            pnl_value_total = ac["pnl_value"] + ap["pnl_value"]
+            unrealized_pnl_total = (ac.get("unrealized_pnl", 0) or 0) + (ap.get("unrealized_pnl", 0) or 0)
 
-            print(f"[MANAGE] ATM Combined PnL Value: {pnl_value_total:.2f} USD "
+            print(f"[MANAGE] ATM Combined Unrealized PnL: ${unrealized_pnl_total:.2f} USD "
                 f"({pnl_pct*100:.2f}%)")
 
             now = datetime.now(self.tz).time()
@@ -405,13 +510,25 @@ class Strategy:
             # --------------------
             # TAKE PROFIT CHECK
             # --------------------
-            print(f"[MANAGE] TAKE PROFIT → current pnl_pct: {pnl_pct*100:.2f}%, "
-                f"required: ≥ {self.tp_pct*100:.2f}%")
+            for tp in self.tp_levels:
+                if tp["done"]:
+                    continue
 
-            if pnl_pct >= self.tp_pct:
-                print("[MANAGE] TAKE PROFIT Triggered")
-                return self.exit_position("TAKE PROFIT")
+                print(
+                    f"[MANAGE] TP CHECK → pnl: {pnl_pct*100:.2f}% "
+                    f"required: {tp['pnl']*100:.0f}%"
+                )
 
+                if pnl_pct >= tp["pnl"]:
+                    self._partial_exit_atm(tp["exit_frac"], f"TP {int(tp['pnl']*100)}%")
+                    tp["done"] = True
+                    break   # only one TP per cycle
+            
+            if self.curr_call_qty <= 0 and self.curr_put_qty <= 0:
+                print("[MANAGE] All quantities exited via TP")
+                self.position_open = False
+                save_active_ids(False, None, None, None, None, self.account)
+                return {"exit_reason": "ALL TP COMPLETED"}
 
             # --------------------
             # STOP LOSS CHECK
@@ -441,13 +558,13 @@ class Strategy:
     def exit_position(self, reason):
         print(f"[Strategy] EXIT — {reason}")
 
-        if self.atm_call_id:
+        if self.atm_call_id and self.curr_call_qty > 0:
             resp = self.broker.place_option_market_order(
                 self.symbol, self.expiry, self.call_strike, "C", self.call_qty, "BUY", self.exchange, True
             )
             self._close_leg(self.atm_call_id, resp)
 
-        if self.atm_put_id:
+        if self.atm_put_id and self.curr_put_qty > 0:
             resp = self.broker.place_option_market_order(
                 self.symbol, self.expiry, self.put_strike, "P", self.put_qty, "BUY", self.exchange, True
             )
@@ -467,7 +584,13 @@ class Strategy:
                 )
                 self._close_leg(self.otm_put_id, resp)
 
-        save_active_ids(False, None, None, None, None)
+        self.init_call_qty = 0
+        self.init_put_qty = 0
+        self.curr_call_qty = 0
+        self.curr_put_qty = 0
+
+
+        save_active_ids(False, None, None, None, None, self.account)
 
         self.atm_call_id = None
         self.atm_put_id = None
@@ -492,21 +615,19 @@ class Strategy:
 
         if entry is not None and close_price is not None:
             if pos["side"] == "SELL":
-                pnl_value = (entry - close_price) * qty
-                pnl_pct = (entry - close_price) / entry
+                realized_pnl = (entry - close_price) * qty
             else:
-                pnl_value = (close_price - entry) * qty
-                pnl_pct = (close_price - entry) / entry
+                realized_pnl = (close_price - entry) * qty
         else:
-            pnl_value = 0
-            pnl_pct = 0
+            realized_pnl = 0
 
         pos["active"] = False
         pos["exit_time"] = now
         pos["close_price"] = close_price
         pos["order_id_exit"] = resp.get("order_id")
-        pos["pnl_value"] = pnl_value
-        pos["pnl_pct"] = pnl_pct
+        pos["qty"] = 0  # Set quantity to 0 when completely closed
+        pos["realized_pnl"] = realized_pnl
+        pos["unrealized_pnl"] = 0.0  # No unrealized PnL for closed positions
         pos["last_update"] = now
 
         update_position_in_json(pos)
@@ -515,37 +636,154 @@ class Strategy:
     # TEST MODE
     def test_place_and_exit_only_atm(self):
         print("\n========== TEST MODE ==========\n")
+        print("Testing: Create Position → Update Position → Partial Close → Full Close\n")
 
-        call = self.broker.place_option_market_order(self.symbol, self.expiry, 684, "C", 1, "SELL", self.exchange)
-        put = self.broker.place_option_market_order(self.symbol, self.expiry, 684, "P", 1, "SELL", self.exchange)
+        # ==========================================
+        # STEP 1: CREATE POSITIONS (ATM only, no hedges)
+        # ==========================================
+        print("\n[TEST STEP 1] Creating ATM positions...")
+        test_strike = 684
+        test_qty = 10
+
+        call = self.broker.place_option_market_order(
+            self.symbol, self.expiry, test_strike, "C", test_qty, "SELL", self.exchange, test_mode=True
+        )
+        put = self.broker.place_option_market_order(
+            self.symbol, self.expiry, test_strike, "P", test_qty, "SELL", self.exchange, test_mode=True
+        )
 
         entry_call = call["fill_price"]
         entry_put = put["fill_price"]
 
+        print(f"[TEST] Call entry: ${entry_call:.2f}, Put entry: ${entry_put:.2f}")
+
         self.atm_call_id = create_position_entry(
-            self.symbol, self.expiry, 684, "C",
-            "SELL", 10, entry_call, call["order_id"], "ATM", self.tz
+            self.account, self.symbol, self.expiry, test_strike, "C",
+            "SELL", test_qty, entry_call, call["order_id"], "ATM", self.tz
         )
 
         self.atm_put_id = create_position_entry(
-            self.symbol, self.expiry, 684, "P",
-            "SELL", 10, entry_put, put["order_id"], "ATM", self.tz
+            self.account, self.symbol, self.expiry, test_strike, "P",
+            "SELL", test_qty, entry_put, put["order_id"], "ATM", self.tz
         )
 
         self.position_open = True
-        save_active_ids(True, self.atm_call_id, self.atm_put_id, None, None)
+        self.init_call_qty = test_qty
+        self.init_put_qty = test_qty
+        self.curr_call_qty = test_qty
+        self.curr_put_qty = test_qty
+        save_active_ids(True, self.atm_call_id, self.atm_put_id, None, None, self.account)
 
-        for i in range(10):
-            self._update_live_leg(self.atm_call_id)
-            self._update_live_leg(self.atm_put_id)
-            print(f"Updated {i+1}/10")
-            time_mod.sleep(1)
+        print(f"[TEST] Positions created: Call ID={self.atm_call_id}, Put ID={self.atm_put_id}")
+        print(f"[TEST] Initial quantities: Call={self.curr_call_qty}, Put={self.curr_put_qty}")
 
-        call_exit = self.broker.place_option_market_order(self.symbol, self.expiry, 684, "C", 10, "BUY", self.exchange)
-        put_exit = self.broker.place_option_market_order(self.symbol, self.expiry, 684, "P", 10, "BUY", self.exchange)
+        # ==========================================
+        # STEP 2: UPDATE POSITIONS (Simulate live updates)
+        # ==========================================
+        print("\n[TEST STEP 2] Updating positions (simulating live market data)...")
+        for i in range(5):
+            self._update_live_leg(self.atm_call_id, test_mode=True)
+            self._update_live_leg(self.atm_put_id, test_mode=True)
+            
+            # Get updated positions to show PnL
+            call_pos = get_position_by_id(self.atm_call_id)
+            put_pos = get_position_by_id(self.atm_put_id)
+            if call_pos and put_pos:
+                total_pnl = (call_pos.get("unrealized_pnl", 0) or 0) + (put_pos.get("unrealized_pnl", 0) or 0)
+                print(f"[TEST] Update {i+1}/5 → Total Unrealized PnL: ${total_pnl:.2f}")
+            
+            time_mod.sleep(2)
+
+        # ==========================================
+        # STEP 3: PARTIAL CLOSE (Close 50% of position)
+        # ==========================================
+        print("\n[TEST STEP 3] Partially closing positions (50%)...")
+        partial_exit_qty = int(test_qty * 0.5)  # Close 50%
+        
+        call_partial = self.broker.place_option_market_order(
+            self.symbol, self.expiry, test_strike, "C", partial_exit_qty, "BUY", self.exchange, test_mode=True
+        )
+        put_partial = self.broker.place_option_market_order(
+            self.symbol, self.expiry, test_strike, "P", partial_exit_qty, "BUY", self.exchange, test_mode=True
+        )
+
+        print(f"[TEST] Partial close: {partial_exit_qty} contracts each")
+        print(f"[TEST] Call partial exit price: ${call_partial['fill_price']:.2f}")
+        print(f"[TEST] Put partial exit price: ${put_partial['fill_price']:.2f}")
+
+        # Update remaining quantities
+        self.curr_call_qty -= partial_exit_qty
+        self.curr_put_qty -= partial_exit_qty
+
+        # Update position in database with new quantity and PnL
+        call_pos = get_position_by_id(self.atm_call_id)
+        put_pos = get_position_by_id(self.atm_put_id)
+        
+        if call_pos:
+            # Calculate realized PnL for partial exit
+            entry = call_pos["entry_price"]
+            exit_price = call_partial["fill_price"]
+            partial_realized_pnl = (entry - exit_price) * partial_exit_qty
+            call_pos["qty"] = self.curr_call_qty
+            call_pos["realized_pnl"] = (call_pos.get("realized_pnl", 0) or 0) + partial_realized_pnl
+            update_position_in_json(call_pos)
+        
+        if put_pos:
+            entry = put_pos["entry_price"]
+            exit_price = put_partial["fill_price"]
+            partial_realized_pnl = (entry - exit_price) * partial_exit_qty
+            put_pos["qty"] = self.curr_put_qty
+            put_pos["realized_pnl"] = (put_pos.get("realized_pnl", 0) or 0) + partial_realized_pnl
+            update_position_in_json(put_pos)
+
+        print(f"[TEST] Remaining quantities: Call={self.curr_call_qty}, Put={self.curr_put_qty}")
+        print(f"[TEST] Positions still active: {self.position_open}")
+
+        # Update positions one more time to show current PnL
+        print("\n[TEST] Updating positions after partial close...")
+        self._update_live_leg(self.atm_call_id, test_mode=True)
+        self._update_live_leg(self.atm_put_id, test_mode=True)
+        call_pos = get_position_by_id(self.atm_call_id)
+        put_pos = get_position_by_id(self.atm_put_id)
+        if call_pos and put_pos:
+            total_unrealized = (call_pos.get("unrealized_pnl", 0) or 0) + (put_pos.get("unrealized_pnl", 0) or 0)
+            total_realized = (call_pos.get("realized_pnl", 0) or 0) + (put_pos.get("realized_pnl", 0) or 0)
+            print(f"[TEST] Current Total Unrealized PnL: ${total_unrealized:.2f}")
+            print(f"[TEST] Current Total Realized PnL: ${total_realized:.2f}")
+
+        # ==========================================
+        # STEP 4: FULL CLOSE (Close remaining position)
+        # ==========================================
+        print("\n[TEST STEP 4] Fully closing remaining positions...")
+        
+        call_exit = self.broker.place_option_market_order(
+            self.symbol, self.expiry, test_strike, "C", self.curr_call_qty, "BUY", self.exchange, test_mode=True
+        )
+        put_exit = self.broker.place_option_market_order(
+            self.symbol, self.expiry, test_strike, "P", self.curr_put_qty, "BUY", self.exchange, test_mode=True
+        )
+
+        print(f"[TEST] Full close: {self.curr_call_qty} call contracts, {self.curr_put_qty} put contracts")
+        print(f"[TEST] Call exit price: ${call_exit['fill_price']:.2f}")
+        print(f"[TEST] Put exit price: ${put_exit['fill_price']:.2f}")
 
         self._close_leg(self.atm_call_id, call_exit)
         self._close_leg(self.atm_put_id, put_exit)
+
+        # Mark position as closed
+        self.position_open = False
+        self.curr_call_qty = 0
+        self.curr_put_qty = 0
+        save_active_ids(False, None, None, None, None, self.account)
+
+        # Get final positions to show final PnL
+        call_pos = get_position_by_id(self.atm_call_id)
+        put_pos = get_position_by_id(self.atm_put_id)
+        if call_pos and put_pos:
+            final_realized = (call_pos.get("realized_pnl", 0) or 0) + (put_pos.get("realized_pnl", 0) or 0)
+            print(f"[TEST] Final Total Realized PnL: ${final_realized:.2f}")
+            print(f"[TEST] Call final Realized PnL: ${call_pos.get('realized_pnl', 0) or 0:.2f}")
+            print(f"[TEST] Put final Realized PnL: ${put_pos.get('realized_pnl', 0) or 0:.2f}")
 
         print("\n========== TEST COMPLETE ==========\n")
 
@@ -617,21 +855,30 @@ class Strategy:
 
 
 class StrategyBroker:
-    def __init__(self, config_path="config.json"):
+    def __init__(self, config_path="config.json", test_mode=False):
         with open(config_path, "r") as f:
             self.config = json.load(f)
 
-        host = self.config["broker"]["host"]
-        port = self.config["broker"]["port"]
-        client_id = self.config["broker"]["client_id"]
+        self.test_mode = test_mode
+        
+        # Skip IBKR connection in test mode
+        if not test_mode:
+            host = self.config["broker"]["host"]
+            port = self.config["broker"]["port"]
+            client_id = self.config["broker"]["client_id"]
 
-        self.ib_broker = IBBroker()
-        self.ib_broker.connect_to_ibkr(host, port, client_id)
+            self.ib_broker = IBBroker()
+            self.ib_broker.connect_to_ibkr(host, port, client_id)
+        else:
+            self.ib_broker = None
+            print("[StrategyBroker] Test mode - skipping IBKR connection")
 
         self.request_id_counter = 1
         self.counter_lock = threading.Lock()
 
     def get_next_available_order_id(self):
+        if self.test_mode:
+            return 1000  # Mock order ID for test mode
         return self.ib_broker.get_next_order_id_from_ibkr()
 
     def reset_order_counter_to_next_available(self):
@@ -641,13 +888,26 @@ class StrategyBroker:
                 self.request_id_counter = next_id - 2000
             print(f"Reset order counter to start from IBKR ID: {next_id}")
 
-    def current_price(self, symbol, exchange):
+    def current_price(self, symbol, exchange, test_mode=False):
+        if test_mode or self.test_mode:
+            # Return mock price around 680-690 for testing
+            return round(random.uniform(680, 690), 2)
+        
         with self.counter_lock:
             req_id = self.request_id_counter + 2000
             self.request_id_counter += 1
         return self.ib_broker.get_index_spot(symbol, req_id, exchange)
 
-    def get_option_premium(self, symbol, expiry, strike, right):
+    def get_option_premium(self, symbol, expiry, strike, right, test_mode=False):
+        # TEST MODE: Return mock premium data
+        if test_mode:
+            return {
+                "bid": round(random.uniform(0.3, 0.8), 2),
+                "ask": round(random.uniform(0.4, 0.9), 2),
+                "last": round(random.uniform(0.35, 0.85), 2),
+                "mid": round(random.uniform(0.35, 0.85), 2)
+            }
+
         with self.counter_lock:
             req_id = self.request_id_counter + 3000
             self.request_id_counter += 1
@@ -666,14 +926,31 @@ class StrategyBroker:
         x = self.ib_broker.get_option_ohlc(symbol, expiry, strike, right, duration, bar_size, req_id)
         return pd.DataFrame(x)
 
-    def place_option_market_order(self, symbol, expiry, strike, right, qty, action, exchange, wait_until_filled=False):
+    def place_option_market_order(self, symbol, expiry, strike, right, qty, action, exchange, wait_until_filled=False, test_mode=False):
         print(f"[BROKER] MARKET ORDER → {action} {qty}x {symbol} {expiry} {strike}{right}")
+
+        # TEST MODE: Return mock data instead of placing actual orders
+        if test_mode:   
+            # Mock fill price based on action (SELL = higher price, BUY = lower price)
+            if action == "SELL":
+                base_price = random.uniform(0.5, 1.5)
+            else:
+                base_price = random.uniform(0.3, 1.2)
+            
+            mock_order_id = random.randint(1000, 9999)
+            mock_fill_price = round(base_price, 2)
+            
+            print(f"[BROKER TEST MODE] Mock order filled → OrderID: {mock_order_id}, Fill: ${mock_fill_price}")
+            return {
+                "order_id": mock_order_id,
+                "fill_price": mock_fill_price
+            }
 
         # Get orderId directly from IBKR
         with self.counter_lock:
-            req_id = req_id = self.get_next_available_order_id()
+            req_id = self.get_next_available_order_id()
 
-        # place the order
+        # Place the order
         order_id, fill_price = self.ib_broker.place_market_option_order(
             symbol, exchange, expiry, strike, right, action, qty, req_id, wait_until_filled
         )
@@ -692,16 +969,116 @@ class StrategyBroker:
 
 # STRATEGY MANAGER
 class StrategyManager:
-    def __init__(self):
-        self.broker = StrategyBroker()
-        self.strategy = Strategy(self, self.broker)
+    def __init__(self, config_path="config.json", account="default", symbol_override=None, strike_range=None, current_atm_price=None, test_mode=False):
+        self.account = account
+        self.config_path = config_path
+        self.strike_range = strike_range if strike_range is not None else [0]  # Default to [0] for backward compatibility
+        self.current_atm_price = current_atm_price
+        self.test_mode = test_mode
+
+        self.broker = StrategyBroker(config_path=config_path, test_mode=test_mode)
+
+        # Load config to get symbol and exchange for ATM price fetch
+        with open(config_path, "r") as f:
+            cfg = json.load(f)
+        self.symbol = symbol_override if symbol_override else cfg["underlying"]["symbol"]
+        self.exchange = cfg["underlying"]["exchange"]
+
+        # Get current ATM price from broker if not provided
+        if self.current_atm_price is None:
+            if test_mode:
+                # Use mock price in test mode
+                print(f"[Manager] Test mode - using mock ATM price")
+                spot = self.broker.current_price(self.symbol, self.exchange, test_mode=True)
+            else:
+                print(f"[Manager] Fetching current ATM price for {self.symbol}...")
+                spot = self.broker.current_price(self.symbol, self.exchange)
+            
+            if spot is None:
+                raise ValueError(f"Could not fetch current price for {self.symbol}")
+            # Round to nearest strike step
+            strike_step = cfg["trade_parameters"]["strike_step"]
+            self.current_atm_price = round(spot / strike_step) * strike_step
+            print(f"[Manager] Current ATM price: {self.current_atm_price}")
+
+        # Create multiple Strategy instances, one for each offset in range
+        self.strategies = []
+        self.strategy_threads = []
+        
+        for offset in self.strike_range:
+            strategy = Strategy(
+                manager=self,
+                broker=self.broker,
+                account=account,
+                config_path=config_path,
+                strike_offset=offset,
+                base_atm_price=self.current_atm_price
+            )
+            # Override symbol if provided
+            if symbol_override:
+                strategy.symbol = symbol_override
+            self.strategies.append(strategy)
+
         self.keep_running = True
+        print(f"[Manager] Created {len(self.strategies)} strategy instances for offsets: {self.strike_range}")
 
     def run(self):
-        self.strategy.run()
+        # TEST MODE: Run test function in main thread only
+        if self.test_mode:
+            print(f"[Manager] TEST MODE - Running test function in main thread only")
+            if not self.strategies:
+                print("[Manager] No strategies available for testing")
+                return
+            
+            # Use first strategy for testing
+            test_strategy = self.strategies[0]
+            print(f"[Manager] Running test on strategy with offset={test_strategy.strike_offset}")
+            test_strategy.test_place_and_exit_only_atm()
+            return
+        
+        print(f"[Manager] Starting {len(self.strategies)} strategies | account={self.account} | ATM={self.current_atm_price}")
+        
+        # Start each strategy in its own thread
+        for i, strategy in enumerate(self.strategies):
+            thread = threading.Thread(
+                target=strategy.run,
+                name=f"Strategy-{strategy.strike_offset}",
+                daemon=False
+            )
+            thread.start()
+            self.strategy_threads.append(thread)
+            print(f"[Manager] Started thread for strategy with offset={strategy.strike_offset}")
+        
+        # Wait for all threads to complete
+        for thread in self.strategy_threads:
+            thread.join() 
         
 
 
 if __name__ == "__main__":
-    manager = StrategyManager()
+    args = parse_args()
+
+    # Parse strike range if provided
+    strike_range = [0]  # Default
+    if args.range:
+        try:
+            start, end = map(int, args.range.split(":"))
+            strike_range = list(range(start, end + 1))
+            print(f"[Main] Parsed strike range: {strike_range}")
+        except ValueError:
+            print(f"[Main] Invalid range format '{args.range}'. Using default [0]")
+            strike_range = [0]
+
+    # In test mode, use single strategy (offset 0) regardless of range
+    if args.test:
+        print("[Main] Test mode enabled - using single strategy (offset=0)")
+        strike_range = [0]
+
+    manager = StrategyManager(
+        config_path=args.config,
+        account=args.account,
+        symbol_override=args.symbol,
+        strike_range=strike_range,
+        test_mode=False
+    )
     manager.run()
