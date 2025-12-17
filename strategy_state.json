@@ -1,0 +1,18 @@
+{
+  "acc2": {
+    "paused": false,
+    "stopped": true
+  },
+  "acc1_SPX": {
+    "paused": false,
+    "stopped": true
+  },
+  "acc1_XSP": {
+    "paused": false,
+    "stopped": true
+  },
+  "acc2_XSP": {
+    "paused": false,
+    "stopped": true
+  }
+}

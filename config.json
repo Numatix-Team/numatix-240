@@ -2,7 +2,7 @@
     "broker": {
         "host": "127.0.0.1",
         "port": 7497,
-        "client_id": 1
+        "client_id": 3
     },
     "underlying": {
         "symbol": "XSP",
@@ -13,8 +13,8 @@
         "date": "20251216"
     },
     "trade_parameters": {
-        "call_quantity": 5,
-        "put_quantity": 5,
+        "call_quantity": 1,
+        "put_quantity": 1,
         "atm_call_offset": 1,
         "atm_put_offset": 1,
         "entry_vwap_multiplier": 0.99,
@@ -45,10 +45,10 @@
     },
     "hedging": {
         "enable_hedges": true,
-        "hedge_call_offset": 3,
-        "hedge_put_offset": 3,
+        "hedge_call_offset": 5,
+        "hedge_put_offset": 5,
         "hedge_quantity": 1
     },
     "paused": false,
-    "stopped": true
+    "stopped": false
 }

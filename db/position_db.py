@@ -141,13 +141,17 @@ class PositionDB:
     # ---------------------------
     # GET ACTIVE POSITIONS
     # ---------------------------
-    def get_active_positions(self, account: Optional[str] = None) -> List[Dict]:
+    def get_active_positions(self, account: Optional[str] = None, symbol: Optional[str] = None) -> List[Dict]:
         query = "SELECT * FROM positions WHERE active=1"
         params = []
 
         if account:
             query += " AND account=?"
             params.append(account)
+        
+        if symbol:
+            query += " AND symbol=?"
+            params.append(symbol)
 
         with self._connect() as conn:
             cur = conn.execute(query, params)
@@ -164,6 +168,43 @@ class PositionDB:
         if account:
             query += " WHERE account=?"
             params.append(account)
+
+        with self._connect() as conn:
+            cur = conn.execute(query, params)
+            rows = cur.fetchall()
+            return [self._row_to_dict(cur, r) for r in rows]
+
+    # ---------------------------
+    # GET POSITIONS WITH FILTERS (for historical data)
+    # ---------------------------
+    def get_positions_with_filters(
+        self, 
+        account: Optional[str] = None,
+        symbol: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None
+    ) -> List[Dict]:
+        """Get positions with optional filters for account, symbol, and date range."""
+        query = "SELECT * FROM positions WHERE 1=1"
+        params = []
+
+        if account:
+            query += " AND account=?"
+            params.append(account)
+
+        if symbol:
+            query += " AND symbol=?"
+            params.append(symbol)
+
+        if start_date:
+            query += " AND entry_time >= ?"
+            params.append(start_date)
+
+        if end_date:
+            # Include positions that were entered on or before end_date
+            # end_date should be in format YYYY-MM-DD, we want to include the entire day
+            query += " AND entry_time <= ?"
+            params.append(f"{end_date} 23:59:59")
 
         with self._connect() as conn:
             cur = conn.execute(query, params)
@@ -229,9 +270,9 @@ class PositionDB:
     # ---------------------------
     # ACTIVE POSITION IDS (for backward compatibility)
     # ---------------------------
-    def get_active_position_ids(self, account: Optional[str] = None) -> Dict:
+    def get_active_position_ids(self, account: Optional[str] = None, symbol: Optional[str] = None) -> Dict:
         """Get active position IDs in the old format for compatibility."""
-        active_positions = self.get_active_positions(account)
+        active_positions = self.get_active_positions(account, symbol)
         
         # Find ATM and OTM positions
         atm_call_id = None

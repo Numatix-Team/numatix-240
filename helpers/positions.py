@@ -101,16 +101,16 @@ def simulated_bid_ask(base_price):
 # ACTIVE POSITION ID MANAGEMENT
 # =========================================================
 
-def load_active_ids(account=None):
+def load_active_ids(account=None, symbol=None):
     """Load active position IDs. Uses database active field."""
-    return _db.get_active_position_ids(account)
+    return _db.get_active_position_ids(account, symbol)
 
 
-def save_active_ids(position_open, atm_call_id, atm_put_id, otm_call_id, otm_put_id, account=None):
+def save_active_ids(position_open, atm_call_id, atm_put_id, otm_call_id, otm_put_id, account=None, symbol=None):
     """Save active position IDs by updating active field in database."""
     # Set all positions to inactive if position_open is False
     if not position_open:
-        active_positions = _db.get_active_positions(account)
+        active_positions = _db.get_active_positions(account, symbol)
         for pos in active_positions:
             _db.update_position(pos["id"], {"active": 0})
         return

@@ -16,6 +16,7 @@ from broker.ib_broker import IBBroker
 from log import setup_logger
 from helpers.positions import *
 from db.position_db import PositionDB
+from helpers.state_manager import is_account_paused, is_account_stopped, set_account_stopped
 
 setup_logger()
 
@@ -143,7 +144,7 @@ class Strategy:
 
     # RESTORE ACTIVE POSITIONS
     def _load_active_ids(self):
-        active = load_active_ids(self.account)
+        active = load_active_ids(self.account, self.symbol)
 
         self.position_open = active.get("position_open", False)
         self.atm_call_id = active.get("atm_call_id")
@@ -234,11 +235,9 @@ class Strategy:
     def calculate_indicators(self):
         df = self.hist_df
         df["turnover"] = df["combined_premium"] * df["combined_volume"]
-
         tot_vol = df["combined_volume"].sum()
         if tot_vol == 0:
             return False
-
         self.vwap = float(df["turnover"].sum() / tot_vol)
         print(f"[Strategy] VWAP={self.vwap:.2f}")
         return True
@@ -264,10 +263,8 @@ class Strategy:
         now = datetime.now(self.tz).time()
         if not (self.entry_start <= now <= self.entry_end):
             return {"action": "NONE"}
-
         cp = self.broker.get_option_premium(self.symbol, self.expiry, self.call_strike, "C")
         pp = self.broker.get_option_premium(self.symbol, self.expiry, self.put_strike, "P")
-
         c_price = self._extract_price(cp)
         p_price = self._extract_price(pp)
         print(c_price,p_price)
@@ -300,81 +297,143 @@ class Strategy:
         combined = signal["combined"]
         print(f"[Strategy] SELL STRADDLE @ {combined}")
         
-        # Hedges
-        if self.enable_hedges:
+        # Track filled legs for rollback if needed
+        filled_legs = []  # List of (position_id, contract_info, qty, side) tuples
+        
+        try:
+            # Hedges
+            if self.enable_hedges:
+                hc = self.broker.place_option_market_order(
+                    self.symbol, self.expiry, self.hedge_call_strike, "C", self.hedge_qty, "BUY", self.exchange
+                )
+                fill_hc = hc.get("fill_price")
+                if fill_hc is None:
+                    print("[EXECUTE] Call hedge failed to fill - closing any filled legs")
+                    self._close_filled_legs(filled_legs)
+                    return
 
-            hc = self.broker.place_option_market_order(
-                self.symbol, self.expiry, self.hedge_call_strike, "C", self.hedge_qty, "BUY", self.exchange
+                self.otm_call_id = create_position_entry(
+                    self.account, self.symbol, self.expiry, self.hedge_call_strike, "C",
+                    "BUY", self.hedge_qty,
+                    fill_hc, hc["order_id"], "OTM", self.tz,
+                    bid=0, ask=0
+                )
+                filled_legs.append((self.otm_call_id, {
+                    "strike": self.hedge_call_strike, "right": "C", "qty": self.hedge_qty, "side": "BUY"
+                }, self.hedge_qty, "BUY"))
+
+                hp = self.broker.place_option_market_order(
+                    self.symbol, self.expiry, self.hedge_put_strike, "P", self.hedge_qty, "BUY", self.exchange
+                )
+                fill_hp = hp.get("fill_price")
+                if fill_hp is None:
+                    print("[EXECUTE] Put hedge failed to fill - closing any filled legs")
+                    self._close_filled_legs(filled_legs)
+                    return
+
+                self.otm_put_id = create_position_entry(
+                    self.account, self.symbol, self.expiry, self.hedge_put_strike, "P",
+                    "BUY", self.hedge_qty,
+                    fill_hp, hp["order_id"], "OTM", self.tz,
+                    bid=0, ask=0
+                )
+                filled_legs.append((self.otm_put_id, {
+                    "strike": self.hedge_put_strike, "right": "P", "qty": self.hedge_qty, "side": "BUY"
+                }, self.hedge_qty, "BUY"))
+
+            # ATM CALL
+            c = self.broker.place_option_market_order(
+                self.symbol, self.expiry, self.call_strike, "C", self.call_qty, "SELL", self.exchange
             )
-            fill_hc = hc["fill_price"]
-            if fill_hc is None:
-                print("Call hedge returned None")
+            fill_call = c.get("fill_price")
+            if fill_call is None:
+                print("[EXECUTE] ATM Call failed to fill - closing any filled legs")
+                self._close_filled_legs(filled_legs)
                 return
 
-            self.otm_call_id = create_position_entry(
-                self.account, self.symbol, self.expiry, self.hedge_call_strike, "C",
-                "BUY", self.hedge_qty,
-                fill_hc, hc["order_id"], "OTM", self.tz,
+            self.atm_call_id = create_position_entry(
+                self.account, self.symbol, self.expiry, self.call_strike, "C",
+                "SELL", self.call_qty,
+                fill_call, c["order_id"], "ATM", self.tz,
                 bid=0, ask=0
             )
+            filled_legs.append((self.atm_call_id, {
+                "strike": self.call_strike, "right": "C", "qty": self.call_qty, "side": "SELL"
+            }, self.call_qty, "SELL"))
 
-            hp = self.broker.place_option_market_order(
-                self.symbol, self.expiry, self.hedge_put_strike, "P", self.hedge_qty, "BUY", self.exchange
+            # ATM PUT
+            p = self.broker.place_option_market_order(
+                self.symbol, self.expiry, self.put_strike, "P", self.put_qty, "SELL", self.exchange
             )
-            fill_hp = hp["fill_price"]
-            if fill_hp is None:
-                print("Put hedge returned None")
+            fill_put = p.get("fill_price")
+            if fill_put is None:
+                print("[EXECUTE] ATM Put failed to fill - closing any filled legs")
+                self._close_filled_legs(filled_legs)
                 return
 
-            self.otm_put_id = create_position_entry(
-                self.account, self.symbol, self.expiry, self.hedge_put_strike, "P",
-                "BUY", self.hedge_qty,
-                fill_hp, hp["order_id"], "OTM", self.tz,
+            self.atm_put_id = create_position_entry(
+                self.account, self.symbol, self.expiry, self.put_strike, "P",
+                "SELL", self.put_qty,
+                fill_put, p["order_id"], "ATM", self.tz,
                 bid=0, ask=0
             )
+            filled_legs.append((self.atm_put_id, {
+                "strike": self.put_strike, "right": "P", "qty": self.put_qty, "side": "SELL"
+            }, self.put_qty, "SELL"))
 
-        # ATM CALL
-        c = self.broker.place_option_market_order(
-            self.symbol, self.expiry, self.call_strike, "C", self.call_qty, "SELL", self.exchange
-        )
-        fill_call = c["fill_price"]
-        if fill_call is None:
-            print("Call strike returned None")
+            # All legs filled successfully
+            self.position_open = True
+            save_active_ids(
+                True, self.atm_call_id, self.atm_put_id, self.otm_call_id, self.otm_put_id, self.account, self.symbol
+            )
+
+            self.init_call_qty = self.call_qty
+            self.init_put_qty  = self.put_qty
+
+            self.curr_call_qty = self.call_qty
+            self.curr_put_qty  = self.put_qty
+            
+        except Exception as e:
+            print(f"[EXECUTE] Error during trade execution: {e} - closing any filled legs")
+            self._close_filled_legs(filled_legs)
+            raise
+
+    def _close_filled_legs(self, filled_legs):
+        """Close all legs that were successfully filled if entry failed"""
+        if not filled_legs:
             return
-
-        self.atm_call_id = create_position_entry(
-            self.account, self.symbol, self.expiry, self.call_strike, "C",
-            "SELL", self.call_qty,
-            fill_call, c["order_id"], "ATM", self.tz,
-            bid=0, ask=0
-        )
-
-        # ATM PUT
-        p = self.broker.place_option_market_order(
-            self.symbol, self.expiry, self.put_strike, "P", self.put_qty, "SELL", self.exchange
-        )
-        fill_put = p["fill_price"]
-        if fill_put is None:
-            print("Put strike returned None")
-            return
-
-        self.atm_put_id = create_position_entry(
-            self.account, self.symbol, self.expiry, self.put_strike, "P",
-            "SELL", self.put_qty,
-            fill_put, p["order_id"], "ATM", self.tz,
-            bid=0, ask=0
-        )
-
-        self.position_open = True
-        save_active_ids(
-            True, self.atm_call_id, self.atm_put_id, self.otm_call_id, self.otm_put_id, self.account
-        )
-
-        self.init_call_qty = self.call_qty
-        self.init_put_qty  = self.put_qty
-
-        self.curr_call_qty = self.call_qty
-        self.curr_put_qty  = self.put_qty
+        
+        print(f"[EXECUTE] Closing {len(filled_legs)} filled leg(s) due to entry failure")
+        
+        for pos_id, contract_info, qty, original_side in filled_legs:
+            try:
+                # Determine opposite action to close
+                # If we originally SELL, we need to BUY to close
+                # If we originally BUY, we need to SELL to close
+                close_action = "BUY" if original_side == "SELL" else "SELL"
+                
+                print(f"[EXECUTE] Closing leg: {close_action} {qty}x {contract_info['strike']}{contract_info['right']}")
+                
+                resp = self.broker.place_option_market_order(
+                    self.symbol, self.expiry, contract_info["strike"], contract_info["right"],
+                    qty, close_action, self.exchange
+                )
+                
+                # Close the position in database
+                if resp and resp.get("fill_price"):
+                    self._close_leg(pos_id, resp)
+                else:
+                    print(f"[EXECUTE] Warning: Could not close leg {pos_id} - order may not have filled")
+                    
+            except Exception as e:
+                print(f"[EXECUTE] Error closing leg {pos_id}: {e}")
+        
+        # Reset position tracking
+        self.atm_call_id = None
+        self.atm_put_id = None
+        self.otm_call_id = None
+        self.otm_put_id = None
+        self.position_open = False
         
         for tp in self.tp_levels:
             tp["done"] = False
@@ -389,30 +448,54 @@ class Strategy:
             pos["symbol"], pos["expiry"], pos["strike"], pos["right"], test_mode=test_mode
         )
 
+        if data is None:
+            print(f"[UPDATE] No data returned for position {pos_id}, skipping update")
+            return
+
         bid = data.get("bid")
         ask = data.get("ask")
 
-        if bid is not None and ask is not None:
-            last_price = (bid + ask) / 2
-        else:
-            last_price = data.get("last") or data.get("mid")
+        # Use last price by default, fallback to mid price if last is not available
+        last_price = data.get("last")
+        if last_price is None:
+            # If last is not available, try mid price (calculated from bid/ask if available)
+            if bid is not None and ask is not None:
+                last_price = (bid + ask) / 2  # Mid price
+            else:
+                last_price = data.get("mid")  # Pre-calculated mid if available
 
-        entry = pos["entry_price"]
-        qty = pos["qty"]
+        # Check if we have a valid price before proceeding
+        if last_price is None:
+            print(f"[UPDATE] No price data available for position {pos_id}, skipping update")
+            return
+
+        entry = pos.get("entry_price")
+        qty = pos.get("qty")
+
+        # Additional None checks for entry and qty
+        if entry is None:
+            print(f"[UPDATE] Entry price is None for position {pos_id}, skipping update")
+            return
+        
+        if qty is None:
+            print(f"[UPDATE] Quantity is None for position {pos_id}, skipping update")
+            return
 
         # -----------------------------
-        # Calculate unrealized PnL
+        # Calculate unrealized PnL (only for remaining quantity)
         # -----------------------------
         if pos["side"] == "SELL":
             unrealized_pnl = (entry - last_price) * qty
         else:
             unrealized_pnl = (last_price - entry) * qty
 
+        existing_realized_pnl = pos.get("realized_pnl", 0.0) or 0.0
+
         pos["bid"] = bid
         pos["ask"] = ask
         pos["last_price"] = last_price
         pos["unrealized_pnl"] = unrealized_pnl
-        pos["realized_pnl"] = 0.0  # No realized PnL for active positions
+        pos["realized_pnl"] = existing_realized_pnl  # Keep existing realized PnL from partial exits
         pos["last_update"] = datetime.now(self.tz).isoformat()
 
         update_position_in_json(pos)
@@ -433,13 +516,13 @@ class Strategy:
             return
 
         # ---- CALL ----
-        self.broker.place_option_market_order(
+        call_resp = self.broker.place_option_market_order(
             self.symbol, self.expiry, self.call_strike,
             "C", call_exit_qty, "BUY", self.exchange, True
         )
 
         # ---- PUT ----
-        self.broker.place_option_market_order(
+        put_resp = self.broker.place_option_market_order(
             self.symbol, self.expiry, self.put_strike,
             "P", put_exit_qty, "BUY", self.exchange, True
         )
@@ -447,6 +530,37 @@ class Strategy:
         # Update CURRENT quantities
         self.curr_call_qty -= call_exit_qty
         self.curr_put_qty  -= put_exit_qty
+
+        # Update database positions with new quantities and realized PnL
+        if self.atm_call_id:
+            call_pos = get_position_by_id(self.atm_call_id)
+            if call_pos:
+                entry = call_pos.get("entry_price")
+                exit_price = call_resp.get("fill_price") if call_resp else None
+                
+                if entry is not None and exit_price is not None:
+                    # Calculate realized PnL for partial exit (SELL side)
+                    partial_realized_pnl = (entry - exit_price) * call_exit_qty
+                    call_pos["realized_pnl"] = (call_pos.get("realized_pnl", 0) or 0) + partial_realized_pnl
+                
+                call_pos["qty"] = self.curr_call_qty
+                call_pos["last_update"] = datetime.now(self.tz).isoformat()
+                update_position_in_json(call_pos)
+
+        if self.atm_put_id:
+            put_pos = get_position_by_id(self.atm_put_id)
+            if put_pos:
+                entry = put_pos.get("entry_price")
+                exit_price = put_resp.get("fill_price") if put_resp else None
+                
+                if entry is not None and exit_price is not None:
+                    # Calculate realized PnL for partial exit (SELL side)
+                    partial_realized_pnl = (entry - exit_price) * put_exit_qty
+                    put_pos["realized_pnl"] = (put_pos.get("realized_pnl", 0) or 0) + partial_realized_pnl
+                
+                put_pos["qty"] = self.curr_put_qty
+                put_pos["last_update"] = datetime.now(self.tz).isoformat()
+                update_position_in_json(put_pos)
 
         print(
             f"[TP] Remaining qty → CALL {self.curr_call_qty}, "
@@ -527,7 +641,7 @@ class Strategy:
             if self.curr_call_qty <= 0 and self.curr_put_qty <= 0:
                 print("[MANAGE] All quantities exited via TP")
                 self.position_open = False
-                save_active_ids(False, None, None, None, None, self.account)
+                save_active_ids(False, None, None, None, None, self.account, self.symbol)
                 return {"exit_reason": "ALL TP COMPLETED"}
 
             # --------------------
@@ -560,13 +674,13 @@ class Strategy:
 
         if self.atm_call_id and self.curr_call_qty > 0:
             resp = self.broker.place_option_market_order(
-                self.symbol, self.expiry, self.call_strike, "C", self.call_qty, "BUY", self.exchange, True
+                self.symbol, self.expiry, self.call_strike, "C", self.curr_call_qty, "BUY", self.exchange, True
             )
             self._close_leg(self.atm_call_id, resp)
 
         if self.atm_put_id and self.curr_put_qty > 0:
             resp = self.broker.place_option_market_order(
-                self.symbol, self.expiry, self.put_strike, "P", self.put_qty, "BUY", self.exchange, True
+                self.symbol, self.expiry, self.put_strike, "P", self.curr_put_qty, "BUY", self.exchange, True
             )
             self._close_leg(self.atm_put_id, resp)
 
@@ -672,7 +786,7 @@ class Strategy:
         self.init_put_qty = test_qty
         self.curr_call_qty = test_qty
         self.curr_put_qty = test_qty
-        save_active_ids(True, self.atm_call_id, self.atm_put_id, None, None, self.account)
+        save_active_ids(True, self.atm_call_id, self.atm_put_id, None, None, self.account, self.symbol)
 
         print(f"[TEST] Positions created: Call ID={self.atm_call_id}, Put ID={self.atm_put_id}")
         print(f"[TEST] Initial quantities: Call={self.curr_call_qty}, Put={self.curr_put_qty}")
@@ -791,16 +905,29 @@ class Strategy:
         print("[Strategy] RUN LOOP STARTED")
 
         while self.manager.keep_running:
+            # Check if paused - if so, just wait and check again
+            if self.manager.paused:
+                print(f"[Strategy-{self.strike_offset}] Paused - waiting...")
+                time_mod.sleep(5)  # Check every 5 seconds when paused
+                continue
 
             # If a position is open → manage it
             if self.position_open:
+                # Reload config and fetch data before managing positions
+                self.load_config(self.config_path)
+                if not self.fetch_data():
+                    time_mod.sleep(poll_interval)
+                    continue
+                if not self.calculate_indicators():
+                    time_mod.sleep(poll_interval)
+                    continue
                 self.manage_positions(10)
                 time_mod.sleep(poll_interval)
                 continue
             print("No position open")
 
-            self.load_config(self.config_path)
             # No position → fetch market data
+            # Config is already loaded in __init__, no need to reload
             if not self.fetch_data():
                 time_mod.sleep(poll_interval)
                 continue
@@ -842,7 +969,7 @@ class Strategy:
             # Write header if new file
             if not file_exists:
                 writer.writerow(["timestamp", "action", "combined", "call_strike",
-                                "put_strike", "vwap"])
+                                "put_strike", "strike_offset", "account", "symbol", "vwap"])
 
             writer.writerow([
                 datetime.now(self.tz).isoformat(),
@@ -850,6 +977,9 @@ class Strategy:
                 combined if combined is not None else "",
                 self.call_strike,
                 self.put_strike,
+                self.strike_offset, 
+                self.account,  
+                self.symbol,  
                 self.vwap
             ])
 
@@ -858,9 +988,7 @@ class StrategyBroker:
     def __init__(self, config_path="config.json", test_mode=False):
         with open(config_path, "r") as f:
             self.config = json.load(f)
-
         self.test_mode = test_mode
-        
         # Skip IBKR connection in test mode
         if not test_mode:
             host = self.config["broker"]["host"]
@@ -975,7 +1103,6 @@ class StrategyManager:
         self.strike_range = strike_range if strike_range is not None else [0]  # Default to [0] for backward compatibility
         self.current_atm_price = current_atm_price
         self.test_mode = test_mode
-
         self.broker = StrategyBroker(config_path=config_path, test_mode=test_mode)
 
         # Load config to get symbol and exchange for ATM price fetch
@@ -1020,6 +1147,7 @@ class StrategyManager:
             self.strategies.append(strategy)
 
         self.keep_running = True
+        self.paused = False
         print(f"[Manager] Created {len(self.strategies)} strategy instances for offsets: {self.strike_range}")
 
     def run(self):
@@ -1038,7 +1166,7 @@ class StrategyManager:
         
         print(f"[Manager] Starting {len(self.strategies)} strategies | account={self.account} | ATM={self.current_atm_price}")
         
-        # Start each strategy in its own thread
+        # Start each strategy in its own thread, with a few seconds delay between each
         for i, strategy in enumerate(self.strategies):
             thread = threading.Thread(
                 target=strategy.run,
@@ -1048,15 +1176,78 @@ class StrategyManager:
             thread.start()
             self.strategy_threads.append(thread)
             print(f"[Manager] Started thread for strategy with offset={strategy.strike_offset}")
+            
+            # Wait a few seconds before starting the next thread (except for the last one)
+            if i < len(self.strategies) - 1:
+                time.sleep(3)  # 3 second delay between thread spawns
+        
+        # Monitor state file and control strategies
+        try:
+            while self.keep_running:
+                # Check if stopped (using account+symbol key)
+                if is_account_stopped(self.account, self.symbol):
+                    print(f"[Manager] Stop signal received for account {self.account} symbol {self.symbol}")
+                    self.keep_running = False
+                    break
+                
+                # Check if paused (using account+symbol key)
+                self.paused = is_account_paused(self.account, self.symbol)
+                
+                time.sleep(2)  # Check state every 2 seconds
+        except KeyboardInterrupt:
+            print(f"[Manager] Keyboard interrupt received")
+            self.keep_running = False
         
         # Wait for all threads to complete
         for thread in self.strategy_threads:
-            thread.join() 
+            thread.join()
+        
+        print(f"[Manager] All strategies stopped for account {self.account}") 
         
 
 
 if __name__ == "__main__":
+    import os
+    import atexit
+    
     args = parse_args()
+    
+    # Write PID to file for frontend to track (account+symbol-specific)
+    account = args.account
+    symbol = args.symbol or "default"  # Use symbol from args or default
+    pid_file = f"bot.{account}.{symbol}.pid"
+    status_file = f"bot.{account}.{symbol}.status"
+    
+    def cleanup_files():
+        """Clean up PID and status files on exit"""
+        try:
+            if os.path.exists(pid_file):
+                os.remove(pid_file)
+            if os.path.exists(status_file):
+                os.remove(status_file)
+            print(f"[Main] Cleaned up tracking files for account {account} on exit")
+        except:
+            pass
+    
+    # Register cleanup on normal exit
+    atexit.register(cleanup_files)
+    
+    # Handle signals for graceful shutdown (Unix/Linux)
+    if os.name != 'nt':
+        import signal
+        signal.signal(signal.SIGTERM, lambda s, f: (cleanup_files(), exit(0)))
+        signal.signal(signal.SIGINT, lambda s, f: (cleanup_files(), exit(0)))
+    
+    try:
+        with open(pid_file, "w") as f:
+            f.write(str(os.getpid()))
+        print(f"[Main] PID written to {pid_file}: {os.getpid()} (account: {account})")
+        
+        # Write initial status
+        with open(status_file, "w") as f:
+            f.write(f"running|{datetime.now().isoformat()}")
+    except Exception as e:
+        print(f"[Main] Warning: Could not write tracking files: {e}")
 
     # Parse strike range if provided
     strike_range = [0]  # Default
@@ -1074,11 +1265,32 @@ if __name__ == "__main__":
         print("[Main] Test mode enabled - using single strategy (offset=0)")
         strike_range = [0]
 
-    manager = StrategyManager(
-        config_path=args.config,
-        account=args.account,
-        symbol_override=args.symbol,
-        strike_range=strike_range,
-        test_mode=False
-    )
-    manager.run()
+    try:
+        manager = StrategyManager(
+            config_path=args.config,
+            account=args.account,
+            symbol_override=args.symbol,
+            strike_range=strike_range,
+            test_mode=False
+        )
+        
+        # Start a background thread to update status file periodically
+        def update_status():
+            while manager.keep_running:
+                try:
+                    paused_state = "paused" if manager.paused else "running"
+                    with open(status_file, "w") as f:
+                        f.write(f"{paused_state}|{datetime.now().isoformat()}|{account}|{args.symbol or manager.symbol}")
+                except:
+                    pass
+                time_mod.sleep(5)  # Update every 5 seconds
+        
+        status_thread = threading.Thread(target=update_status, daemon=True)
+        status_thread.start()
+        
+        manager.run()
+    finally:
+        # Clear stop state when exiting
+        from helpers.state_manager import clear_account_state
+        clear_account_state(account, symbol)
+        cleanup_files()
