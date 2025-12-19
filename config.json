@@ -2,7 +2,7 @@
     "broker": {
         "host": "127.0.0.1",
         "port": 7497,
-        "client_id": 3
+        "client_id": 2
     },
     "underlying": {
         "symbol": "XSP",
@@ -10,7 +10,7 @@
         "currency": "USD"
     },
     "expiry": {
-        "date": "20251216"
+        "date": "20251218"
     },
     "trade_parameters": {
         "call_quantity": 1,

@@ -4,8 +4,24 @@ from typing import Optional, List, Dict
 
 
 class PositionDB:
-    def __init__(self, db_path="positions.db"):
-        self.db_path = db_path
+    def __init__(self, db_path=None, account=None, symbol=None):
+        """
+        Initialize PositionDB with account and symbol.
+        If account and symbol are provided, uses account+symbol specific database.
+        Otherwise uses the provided db_path (for backward compatibility).
+        """
+        if account and symbol:
+            # Use account+symbol specific database
+            self.db_path = f"positions_{account}_{symbol}.db"
+        elif db_path:
+            # Use provided path (backward compatibility)
+            self.db_path = db_path
+        else:
+            # Default to old format for backward compatibility
+            self.db_path = "positions.db"
+        
+        self.account = account
+        self.symbol = symbol
         self.lock = threading.Lock()
         self._init_db()
 

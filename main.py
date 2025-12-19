@@ -62,13 +62,14 @@ def parse_args():
 
 class Strategy:
 
-    def __init__(self, manager, broker, account, config_path="config.json", strike_offset=0, base_atm_price=None):
+    def __init__(self, manager, broker, account, config_path="config.json", strike_offset=0, base_atm_price=None, symbol=None):
         self.manager = manager
         self.broker = broker
         self.config_path = config_path
         self.account = account
         self.strike_offset = strike_offset  # n value: strike = ATM + n
         self.base_atm_price = base_atm_price  # Base ATM price from broker
+        self.symbol_override = symbol  # Symbol passed from frontend (overrides config)
 
         # runtime active IDs
         self.atm_call_id = None
@@ -80,6 +81,10 @@ class Strategy:
         self.position = None
 
         self.load_config(config_path)
+        
+        # Override symbol if provided (from frontend)
+        if self.symbol_override:
+            self.symbol = self.symbol_override
 
         self.atm = None
         self.call_strike = None
@@ -186,11 +191,11 @@ class Strategy:
         atm_with_offset = atm + self.strike_offset * self.strike_step
         self.atm = atm_with_offset
         self.call_strike = atm_with_offset + self.atm_call_offset * self.strike_step
-        self.put_strike = atm_with_offset - self.atm_put_offset * self.strike_step
+        self.put_strike = atm_with_offset + self.atm_put_offset * self.strike_step
 
         if self.enable_hedges:
             self.hedge_call_strike = atm_with_offset + self.hedge_call_offset * self.strike_step
-            self.hedge_put_strike = atm_with_offset - self.hedge_put_offset * self.strike_step
+            self.hedge_put_strike = atm_with_offset + self.hedge_put_offset * self.strike_step
 
         print(f"[Strategy] Offset={self.strike_offset}, Base_ATM={atm}, ATM={atm_with_offset}, CALL={self.call_strike}, PUT={self.put_strike}")
 
@@ -234,6 +239,8 @@ class Strategy:
     # VWAP
     def calculate_indicators(self):
         df = self.hist_df
+        df.to_csv("hist_df.csv")
+        print(df["combined_volume"].sum())
         df["turnover"] = df["combined_premium"] * df["combined_volume"]
         tot_vol = df["combined_volume"].sum()
         if tot_vol == 0:
@@ -282,7 +289,7 @@ class Strategy:
             self._spread(cp) > self.max_spread,
             self._spread(pp) > self.max_spread
         ]):
-            return {"action": "NONE"}
+            return {"action": "SKIPPED DUE TO SPREAD"}
 
         threshold = self.vwap * self.entry_vwap_mult
 
@@ -298,7 +305,7 @@ class Strategy:
         print(f"[Strategy] SELL STRADDLE @ {combined}")
         
         # Track filled legs for rollback if needed
-        filled_legs = []  # List of (position_id, contract_info, qty, side) tuples
+        filled_legs = []
         
         try:
             # Hedges
@@ -440,7 +447,7 @@ class Strategy:
 
     # LIVE UPDATES
     def _update_live_leg(self, pos_id, test_mode=False):
-        pos = get_position_by_id(pos_id)
+        pos = get_position_by_id(pos_id, self.account, self.symbol)
         if pos is None or not pos.get("active", False):
             return
 
@@ -533,7 +540,7 @@ class Strategy:
 
         # Update database positions with new quantities and realized PnL
         if self.atm_call_id:
-            call_pos = get_position_by_id(self.atm_call_id)
+            call_pos = get_position_by_id(self.atm_call_id, self.account, self.symbol)
             if call_pos:
                 entry = call_pos.get("entry_price")
                 exit_price = call_resp.get("fill_price") if call_resp else None
@@ -548,7 +555,7 @@ class Strategy:
                 update_position_in_json(call_pos)
 
         if self.atm_put_id:
-            put_pos = get_position_by_id(self.atm_put_id)
+            put_pos = get_position_by_id(self.atm_put_id, self.account, self.symbol)
             if put_pos:
                 entry = put_pos.get("entry_price")
                 exit_price = put_resp.get("fill_price") if put_resp else None
@@ -586,8 +593,8 @@ class Strategy:
             if self.enable_hedges and self.otm_put_id: self._update_live_leg(self.otm_put_id)
 
             # Fetch updated ATM legs
-            ac = get_position_by_id(self.atm_call_id)
-            ap = get_position_by_id(self.atm_put_id)
+            ac = get_position_by_id(self.atm_call_id, self.account, self.symbol)
+            ap = get_position_by_id(self.atm_put_id, self.account, self.symbol)
 
             if not ac or not ap:
                 print("[MANAGE] ATM legs not ready yet → waiting")
@@ -704,7 +711,7 @@ class Strategy:
         self.curr_put_qty = 0
 
 
-        save_active_ids(False, None, None, None, None, self.account)
+        save_active_ids(False, None, None, None, None, self.account, self.symbol)
 
         self.atm_call_id = None
         self.atm_put_id = None
@@ -716,7 +723,7 @@ class Strategy:
 
     # CLOSE LEG
     def _close_leg(self, pos_id, resp):
-        pos = get_position_by_id(pos_id)
+        pos = get_position_by_id(pos_id, self.account, self.symbol)
         if pos is None:
             return
 
@@ -800,8 +807,8 @@ class Strategy:
             self._update_live_leg(self.atm_put_id, test_mode=True)
             
             # Get updated positions to show PnL
-            call_pos = get_position_by_id(self.atm_call_id)
-            put_pos = get_position_by_id(self.atm_put_id)
+            call_pos = get_position_by_id(self.atm_call_id, self.account, self.symbol)
+            put_pos = get_position_by_id(self.atm_put_id, self.account, self.symbol)
             if call_pos and put_pos:
                 total_pnl = (call_pos.get("unrealized_pnl", 0) or 0) + (put_pos.get("unrealized_pnl", 0) or 0)
                 print(f"[TEST] Update {i+1}/5 → Total Unrealized PnL: ${total_pnl:.2f}")
@@ -888,7 +895,7 @@ class Strategy:
         self.position_open = False
         self.curr_call_qty = 0
         self.curr_put_qty = 0
-        save_active_ids(False, None, None, None, None, self.account)
+        save_active_ids(False, None, None, None, None, self.account, self.symbol)
 
         # Get final positions to show final PnL
         call_pos = get_position_by_id(self.atm_call_id)
@@ -913,8 +920,7 @@ class Strategy:
 
             # If a position is open → manage it
             if self.position_open:
-                # Reload config and fetch data before managing positions
-                self.load_config(self.config_path)
+                # Fetch data before managing positions (config already loaded, no need to reload every cycle)
                 if not self.fetch_data():
                     time_mod.sleep(poll_interval)
                     continue
@@ -985,6 +991,11 @@ class Strategy:
 
 
 class StrategyBroker:
+    """
+    Thread-safe broker wrapper for IBKR API.
+    Designed to be shared across multiple Strategy instances running in separate threads.
+    Uses locks to ensure thread-safe access to shared resources.
+    """
     def __init__(self, config_path="config.json", test_mode=False):
         with open(config_path, "r") as f:
             self.config = json.load(f)
@@ -995,6 +1006,8 @@ class StrategyBroker:
             port = self.config["broker"]["port"]
             client_id = self.config["broker"]["client_id"]
 
+            # Single IBBroker instance shared across all strategies
+            # IBBroker has its own internal lock for thread safety
             self.ib_broker = IBBroker()
             self.ib_broker.connect_to_ibkr(host, port, client_id)
         else:
@@ -1002,7 +1015,7 @@ class StrategyBroker:
             print("[StrategyBroker] Test mode - skipping IBKR connection")
 
         self.request_id_counter = 1
-        self.counter_lock = threading.Lock()
+        self.counter_lock = threading.Lock()  # Thread-safe lock for request ID counter
 
     def get_next_available_order_id(self):
         if self.test_mode:
@@ -1047,7 +1060,7 @@ class StrategyBroker:
             self.request_id_counter += 1
         return self.ib_broker.get_option_tick(symbol, expiry, strike, right, req_id)
 
-    def get_option_ohlc(self, symbol, expiry, strike, right, duration="1 D", bar_size="1 min"):
+    def get_option_ohlc(self, symbol, expiry, strike, right, duration="2 D", bar_size="1 min"):
         with self.counter_lock:
             req_id = self.request_id_counter + 6000
             self.request_id_counter += 1
@@ -1139,11 +1152,9 @@ class StrategyManager:
                 account=account,
                 config_path=config_path,
                 strike_offset=offset,
-                base_atm_price=self.current_atm_price
+                base_atm_price=self.current_atm_price,
+                symbol=symbol_override  # Pass symbol from frontend to Strategy
             )
-            # Override symbol if provided
-            if symbol_override:
-                strategy.symbol = symbol_override
             self.strategies.append(strategy)
 
         self.keep_running = True

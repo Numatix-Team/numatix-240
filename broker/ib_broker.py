@@ -383,7 +383,7 @@ class IBBroker(EWrapper, EClient):
             self.reqMktData(reqId, contract, "", False, False, [])
             # Wait for price to arrive
             for _ in range(20):   # wait up to ~5 seconds
-                time.sleep(0.25)
+                time.sleep(10)
                 with self.lock:
                     if reqId in self.prices:
                         last = self.prices[reqId].get("last")
@@ -484,7 +484,7 @@ class IBBroker(EWrapper, EClient):
         contract = Contract()
         contract.symbol = symbol
         contract.secType = "OPT"
-        contract.exchange = "SMART"
+        contract.exchange = "CBOE"
         contract.currency = "USD"
         contract.lastTradeDateOrContractMonth = expiry
         contract.strike = float(strike)
@@ -499,14 +499,14 @@ class IBBroker(EWrapper, EClient):
             duration,            # how far back
             bar_size,            # candle size
             "TRADES",            # data type
-            1,                   # useRTH=0 => include pre/post market
+            0,                   # useRTH=0 => include pre/post market
             1,                   # formatDate=1 => string dates
             False,               # keepUpToDate
             []
         )
 
         # Wait until data arrives
-        timeout = 50
+        timeout = 100
         for _ in range(timeout):
             time.sleep(0.1)
             if req_id in self.historical_data:

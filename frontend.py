@@ -9,6 +9,7 @@ from datetime import datetime
 import pytz
 import time
 from db.position_db import PositionDB
+from db.multi_account_db import MultiAccountDB
 from helpers.state_manager import (
     set_account_paused, set_account_stopped, 
     is_account_paused, is_account_stopped,
@@ -17,14 +18,35 @@ from helpers.state_manager import (
 python_path = sys.executable
 st_autorefresh(interval=5000, limit=None, key="auto_refresh")
 
-# Database instance
-_db = PositionDB()
+# Database instance - uses MultiAccountDB to query across all account+symbol databases
+_db = MultiAccountDB()
 
 # Eastern timezone
 EASTERN_TZ = pytz.timezone("US/Eastern")
 
 CONFIG_PATH = "config.json"
 POSITIONS_PATH = "positions.json"
+ACCOUNTS_PATH = "accounts.json"
+SYMBOLS_PATH = "symbols.json"
+
+# Helper functions to load accounts and symbols
+def load_accounts():
+    """Load accounts from accounts.json"""
+    try:
+        with open(ACCOUNTS_PATH, "r") as f:
+            data = json.load(f)
+            return [acc["nickname"] for acc in data.get("accounts", [])]
+    except:
+        return ["acc1", "acc2", "acc3"]  # Default fallback
+
+def load_symbols():
+    """Load symbols from symbols.json"""
+    try:
+        with open(SYMBOLS_PATH, "r") as f:
+            data = json.load(f)
+            return data.get("symbols", [])
+    except:
+        return ["SPX", "XSP", "QQQ"]  # Default fallback
 # Account+symbol-specific PID/status file paths
 def get_pid_path(account, symbol=None):
     if symbol:
@@ -232,9 +254,24 @@ def edit_config_page():
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        expiry["date"] = st.text_input("Expiry Date (YYYYMMDD)", expiry["date"])
-    with col2:
-        st.write("")
+        expiry_date_input = st.text_input(
+            "Expiry Date (YYYYMMDD)", 
+            value=expiry.get("date", ""),
+            key="expiry_date_input",
+            help="Format: YYYYMMDD (e.g., 20251217 for December 17, 2025)"
+        )
+        # Validate format: must be 8 digits
+        if expiry_date_input and (not expiry_date_input.isdigit() or len(expiry_date_input) != 8):
+            st.error("❌ Expiry date must be 8 digits in YYYYMMDD format (e.g., 20251217)")
+        # Always update the config with the input value (validation happens on save)
+        expiry["date"] = expiry_date_input
+    # with col2:
+    #     if expiry.get("date") and expiry["date"].isdigit() and len(expiry["date"]) == 8:
+    #         st.success(f"✓ Valid: {expiry['date']}")
+    #     elif expiry.get("date"):
+    #         st.warning(f"⚠ Invalid format: {expiry['date']}")
+    #     else:
+    #         st.warning("No expiry date set")
     with col3:
         st.write("")
 
@@ -366,8 +403,15 @@ def edit_config_page():
         st.error("❌ Total TP exit percentage exceeds 100%")
         return
 
+    # Validate expiry date format before allowing save
+    expiry_date = expiry.get("date", "")
+    if expiry_date and (not expiry_date.isdigit() or len(expiry_date) != 8):
+        st.error("❌ Cannot save: Expiry date must be 8 digits in YYYYMMDD format (e.g., 20251217)")
+        expiry_valid = False
+    else:
+        expiry_valid = True
 
-    if st.button("Save Configuration"):
+    if st.button("Save Configuration", disabled=not expiry_valid):
         save_json(CONFIG_PATH, config)
 
 
@@ -381,20 +425,25 @@ def positions_page():
     # Get filters
     col1, col2 = st.columns(2)
     
+    accounts_list = load_accounts()
+    symbols_list = load_symbols()
+    
     with col1:
         account = st.selectbox(
             "Filter by Account",
-            [None, "acc1", "acc2", "acc3"],
+            [None] + accounts_list,
             format_func=lambda x: "All Accounts" if x is None else x,
-            index=0
+            index=0,
+            key="pos_account"
         )
     
     with col2:
         symbol = st.selectbox(
             "Filter by Instrument",
-            [None, "SPX", "XSP", "QQQ"],
+            [None] + symbols_list,
             format_func=lambda x: "All Instruments" if x is None else x,
-            index=0
+            index=0,
+            key="pos_symbol"
         )
 
     # Get today's date in Eastern time
@@ -496,27 +545,27 @@ def positions_page():
 
     st.markdown("---")
 
-    # ------------------------------------
-    # ACTIVE POSITIONS
-    # ------------------------------------
-    st.subheader("Active Positions")
+    # # ------------------------------------
+    # # ACTIVE POSITIONS
+    # # ------------------------------------
+    # st.subheader("Active Positions")
 
-    if not active_ids["position_open"]:
-        st.info("No active positions.")
-    else:
-        col1, col2 = st.columns(2)
+    # if not active_ids["position_open"]:
+    #     st.info("No active positions.")
+    # else:
+    #     col1, col2 = st.columns(2)
 
-        with col1:
-            st.write("### ATM Positions")
-            st.write(f"**ATM Call ID:** {active_ids.get('atm_call_id')}")
-            st.write(f"**ATM Put ID:** {active_ids.get('atm_put_id')}")
+    #     with col1:
+    #         st.write("### ATM Positions")
+    #         st.write(f"**ATM Call ID:** {active_ids.get('atm_call_id')}")
+    #         st.write(f"**ATM Put ID:** {active_ids.get('atm_put_id')}")
 
-        with col2:
-            st.write("### OTM Positions")
-            st.write(f"**OTM Call ID:** {active_ids.get('otm_call_id')}")
-            st.write(f"**OTM Put ID:** {active_ids.get('otm_put_id')}")
+    #     with col2:
+    #         st.write("### OTM Positions")
+    #         st.write(f"**OTM Call ID:** {active_ids.get('otm_call_id')}")
+    #         st.write(f"**OTM Put ID:** {active_ids.get('otm_put_id')}")
 
-    st.markdown("---")
+    # st.markdown("---")
 
     # ------------------------------------
     # ALL POSITIONS TABLE
@@ -569,15 +618,24 @@ def update_flags(paused=None, stopped=None):
 def historical_data_page():
     st.header("Historical Data Analysis")
     
+    # Initialize session state for cached query results
+    if "hist_query_results" not in st.session_state:
+        st.session_state.hist_query_results = None
+    if "hist_query_filters" not in st.session_state:
+        st.session_state.hist_query_filters = None
+    
     # Filters section
     st.subheader("Filters")
     
     col1, col2 = st.columns(2)
     
+    accounts_list = load_accounts()
+    symbols_list = load_symbols()
+    
     with col1:
         account = st.selectbox(
             "Filter by Account",
-            [None, "acc1", "acc2", "acc3"],
+            [None] + accounts_list,
             format_func=lambda x: "All Accounts" if x is None else x,
             index=0,
             key="hist_account"
@@ -586,7 +644,7 @@ def historical_data_page():
     with col2:
         symbol = st.selectbox(
             "Filter by Instrument",
-            [None, "SPX", "XSP", "QQQ"],
+            [None] + symbols_list,
             format_func=lambda x: "All Instruments" if x is None else x,
             index=0,
             key="hist_symbol"
@@ -613,10 +671,23 @@ def historical_data_page():
     # Validate date range
     if start_date and end_date and start_date > end_date:
         st.error("Start date must be before or equal to end date.")
+        # Clear cached results if validation fails
+        if st.session_state.hist_query_results:
+            st.session_state.hist_query_results = None
+            st.session_state.hist_query_filters = None
         return
     
+    # Clear cache button
+    col_clear1, col_clear2, col_clear3 = st.columns([1, 1, 3])
+    with col_clear1:
+        if st.button("Clear Cache", help="Clear cached query results"):
+            st.session_state.hist_query_results = None
+            st.session_state.hist_query_filters = None
+            st.rerun()
+    
     # Query button
-    if st.button("Query Historical Data", type="primary"):
+    query_clicked = st.button("Query Historical Data", type="primary")
+    if query_clicked:
         # Format dates for database query
         start_date_str = start_date.strftime("%Y-%m-%d") if start_date else None
         end_date_str = end_date.strftime("%Y-%m-%d") if end_date else None
@@ -629,9 +700,40 @@ def historical_data_page():
             end_date=end_date_str
         )
         
+        # Save query results and filters to session state
+        st.session_state.hist_query_results = positions
+        st.session_state.hist_query_filters = {
+            "account": account,
+            "symbol": symbol,
+            "start_date": start_date_str,
+            "end_date": end_date_str
+        }
+        
         if not positions:
             st.warning("No positions found matching the selected criteria.")
+            # Clear cached results if no positions found
+            st.session_state.hist_query_results = None
+            st.session_state.hist_query_filters = None
             return
+    
+    # Check if we have cached results to display (either from new query or previous session)
+    if st.session_state.hist_query_results is not None:
+        positions = st.session_state.hist_query_results
+        filters = st.session_state.hist_query_filters
+        
+        # Show info about cached data
+        filter_info = []
+        if filters["account"]:
+            filter_info.append(f"Account: {filters['account']}")
+        if filters["symbol"]:
+            filter_info.append(f"Symbol: {filters['symbol']}")
+        if filters["start_date"]:
+            filter_info.append(f"From: {filters['start_date']}")
+        if filters["end_date"]:
+            filter_info.append(f"To: {filters['end_date']}")
+        
+        # if filter_info:
+        #     st.info(f"📊 Showing cached results ({len(positions)} positions) | Filters: {', '.join(filter_info)}")
         
         # Display summary
         st.markdown("---")
@@ -724,12 +826,23 @@ def historical_data_page():
         
         # Download button
         csv = df.to_csv(index=False)
+        
+        # Use cached filter values for filename
+        cache_filters = st.session_state.hist_query_filters
+        download_account = cache_filters.get("account") or "all"
+        download_symbol = cache_filters.get("symbol") or "all"
+        download_start = cache_filters.get("start_date") or "all"
+        download_end = cache_filters.get("end_date") or "all"
+        
         st.download_button(
             label="Download as CSV",
             data=csv,
-            file_name=f"historical_data_{account or 'all'}_{symbol or 'all'}_{start_date_str or 'all'}_{end_date_str or 'all'}.csv",
+            file_name=f"historical_data_{download_account}_{download_symbol}_{download_start}_{download_end}.csv",
             mime="text/csv"
         )
+    else:
+        # No cached data - show message
+        st.info("👆 Use the filters above and click 'Query Historical Data' to view historical position data.")
 
 # -------------------------------------
 # STATUS INDICATOR
@@ -839,18 +952,21 @@ def main():
 
     col1, col2 = st.columns(2)
 
+    accounts_list = load_accounts()
+    symbols_list = load_symbols()
+
     with col1:
         account = st.selectbox(
             "Select Account",
-            ["acc1", "acc2", "acc3"],
-            index=0
+            accounts_list,
+            index=0 if accounts_list else 0
         )
 
     with col2:
         symbol = st.selectbox(
             "Select Symbol",
-            ["SPX", "XSP", "QQQ"],
-            index=0
+            symbols_list,
+            index=0 if symbols_list else 0
         )
 
     st.markdown("---")

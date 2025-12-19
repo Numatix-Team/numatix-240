@@ -13,6 +13,10 @@
   },
   "acc2_XSP": {
     "paused": false,
+    "stopped": false
+  },
+  "acc2_SPX": {
+    "paused": false,
     "stopped": true
   }
 }
