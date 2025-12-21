@@ -18,5 +18,9 @@
   "acc2_SPX": {
     "paused": false,
     "stopped": true
+  },
+  "Vedansh_XSP": {
+    "paused": false,
+    "stopped": false
   }
 }
