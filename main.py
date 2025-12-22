@@ -234,21 +234,53 @@ class Strategy:
         # 9) Save final dataframe
         # -------------------------------
         self.hist_df = df
+       
         return True
 
     # VWAP
+    # def calculate_indicators(self):
+    #     df = self.hist_df
+    #     df.to_csv("hist_df.csv")
+    #     print(df["combined_volume"].sum())
+    #     df["turnover"] = df["combined_premium"] * df["combined_volume"]
+    #     tot_vol = df["combined_volume"].sum()
+    #     if tot_vol == 0:
+    #         return False
+    #     self.vwap = float(df["turnover"].sum() / tot_vol)
+    #     print(f"[Strategy] VWAP={self.vwap:.2f}")
+        
+    #     return True
     def calculate_indicators(self):
-        df = self.hist_df
-        df.to_csv("hist_df.csv")
-        print(df["combined_volume"].sum())
+        df = self.hist_df.copy()
+        # Save raw data (debugging / plotting)
+        df.to_csv("hist_df.csv", index=False)
+        # Ensure numeric (very important with live feeds)
+        df["combined_premium"] = pd.to_numeric(df["combined_premium"], errors="coerce")
+        df["combined_volume"] = pd.to_numeric(df["combined_volume"], errors="coerce")
+        # Turnover
         df["turnover"] = df["combined_premium"] * df["combined_volume"]
+
+        # Cumulative values
+        df["cum_turnover"] = df["turnover"].cumsum()
+        df["cum_volume"] = df["combined_volume"].cumsum()
+
+        # VWAP column (safe division)
+        df["vwap"] = df["cum_turnover"] / df["cum_volume"].replace(0, pd.NA)
+
+        # Total VWAP for session
         tot_vol = df["combined_volume"].sum()
         if tot_vol == 0:
             return False
-        self.vwap = float(df["turnover"].sum() / tot_vol)
-        print(f"[Strategy] VWAP={self.vwap:.2f}")
-        return True
 
+        self.vwap = float(df["turnover"].sum() / tot_vol)
+
+        print(f"[Strategy] VWAP={self.vwap:.2f}")
+
+        # Push back to class
+        self.hist_df = df
+        self.hist_df.to_csv("check_Arya.csv", index=False)
+
+        return True
     # Utility
     def _extract_price(self, d):
         if not d:
