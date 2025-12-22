@@ -5,4 +5,5 @@ streamlit>=1.28.0
 streamlit-autorefresh>=0.0.6
 ibapi>=9.81.1
 ib-insync>=0.9.86
+matplotlib>=3.7.0
 
