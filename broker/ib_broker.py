@@ -383,7 +383,7 @@ class IBBroker(EWrapper, EClient):
             self.reqMktData(reqId, contract, "", False, False, [])
             # Wait for price to arrive
             for _ in range(20):   # wait up to ~5 seconds
-                time.sleep(0.25)
+                time.sleep(10)
                 with self.lock:
                     if reqId in self.prices:
                         last = self.prices[reqId].get("last")
@@ -484,7 +484,7 @@ class IBBroker(EWrapper, EClient):
         contract = Contract()
         contract.symbol = symbol
         contract.secType = "OPT"
-        contract.exchange = "SMART"
+        contract.exchange = "CBOE"
         contract.currency = "USD"
         contract.lastTradeDateOrContractMonth = expiry
         contract.strike = float(strike)
@@ -506,7 +506,7 @@ class IBBroker(EWrapper, EClient):
         )
 
         # Wait until data arrives
-        timeout = 20
+        timeout = 100
         for _ in range(timeout):
             time.sleep(0.1)
             if req_id in self.historical_data:
@@ -526,3 +526,78 @@ class IBBroker(EWrapper, EClient):
         ]
 
         return ohlc
+    
+    def place_market_option_order(self, symbol, exchange, expiry, strike, right, action, quantity, reqid, wait_until_filled=False):
+        contract = Contract()
+        contract.symbol = symbol
+        contract.secType = "OPT"
+        contract.exchange = exchange
+        contract.currency = "USD"
+        contract.lastTradeDateOrContractMonth = expiry
+        contract.strike = float(strike)
+        contract.right = right
+
+        order = Order()
+        order.action = action 
+        order.totalQuantity = abs(int(quantity))
+        order.orderType = "MKT"
+        order.eTradeOnly = False
+        order.firmQuoteOnly = False
+
+        print(f"[IBAPI] Placing OPTION order → {order.action} {abs(quantity)} {symbol} {right} {strike} exp:{expiry}")
+
+        try:
+            self.placeOrder(reqid, contract, order)
+            print(f"[IBAPI] Order submitted. OrderId = {reqid}")
+        except Exception as e:
+            print(f"[IBAPI ERROR] Failed to place option order: {e}")
+            return None, None
+
+        timeout = 20  # seconds
+        waited = 0
+
+        while True:
+            time.sleep(0.2)
+            waited += 0.2
+
+            with self.lock:
+                status_data = self.order_status.get(reqid, {})
+                status = status_data.get("status")
+                fill_price = status_data.get("avgFillPrice")
+
+                if status == "Filled":
+                    print(f"[IBAPI] Order Filled → Price: {fill_price}")
+                    return reqid, fill_price
+
+                if fill_price not in [None, 0]:
+                    print(f"[IBAPI] Partial Fill → Price: {fill_price}")
+                    if not wait_until_filled:
+                        return reqid, fill_price
+                    # If waiting indefinitely → keep waiting
+
+            # ---- TIMEOUT MODE ----
+            if not wait_until_filled and waited >= timeout:
+                print(f"[IBAPI] Order not filled in {timeout}s → Cancelling OrderId {reqid}")
+                try:
+                    self.cancelOrder(reqid)
+                except:
+                    pass
+                break  # exit wait loop
+
+        # ---------------------------------------------
+        # AFTER TIMEOUT → CHECK FOR LATE PARTIAL FILLS
+        # ---------------------------------------------
+        time.sleep(1)
+        with self.lock:
+            status_data = self.order_status.get(reqid, {})
+            fill_price = status_data.get("avgFillPrice", None)
+
+            if fill_price not in [None, 0]:
+                print(f"[IBAPI] Received late partial fill → Price: {fill_price}")
+                return reqid, fill_price
+
+        print(f"[IBAPI] Order cancelled with NO fills.")
+        return reqid, None
+
+            
+

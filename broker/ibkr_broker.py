@@ -1,7 +1,7 @@
 
 import time
 import math
-
+import json
 import pytz
 import datetime as dt
 
@@ -561,11 +561,92 @@ class IBTWSAPI:
         
         return closed_count, total_pnl
 
+    def close_all_option_positions(self, reason="manual_close"):
+        """Close all open option positions only"""
+        print(f"\n=== CLOSING ALL OPTION POSITIONS ({reason}) ===")
+        
+        # First cancel all open orders
+        print("Cancelling all open orders...")
+        self.close_all_open_orders()
+        
+        # Get all positions
+        positions = self.get_positions()
+        if not positions:
+            print("No open positions found")
+            return 0, 0.0
+        
+        closed_count = 0
+        total_pnl = 0.0
+        
+        # Filter for option positions only
+        option_positions = [pos for pos in positions if pos.contract.secType == "OPT"]
+        
+        if not option_positions:
+            print("No open option positions found")
+            return 0, 0.0
+        
+        print(f"Found {len(option_positions)} open option positions")
+        
+        for position in option_positions:
+            try:
+                original_contract = position.contract
+                current_position = position.position
+                
+                if current_position == 0:
+                    continue
+                
+                # Build contract description
+                contract_desc = f"{original_contract.symbol} {original_contract.lastTradeDateOrContractMonth} {original_contract.strike}{original_contract.right}"
+                print(f"Closing option position: {contract_desc} - Quantity: {current_position}")
+                
+                # Determine action based on position
+                if current_position > 0:
+                    # Long position - sell to close
+                    action = "SELL"
+                    quantity = current_position
+                else:
+                    # Short position - buy to close
+                    action = "BUY"
+                    quantity = abs(current_position)
+                
+                # Create a new Option contract with exchange specified (required for orders)
+                contract = Option(
+                    symbol=original_contract.symbol,
+                    lastTradeDateOrContractMonth=original_contract.lastTradeDateOrContractMonth,
+                    strike=original_contract.strike,
+                    right=original_contract.right,
+                    exchange="SMART",  # Use SMART routing
+                    currency=self.currency,
+                    multiplier='100',
+                )
+                
+                # Place market order to close option position
+                order = MarketOrder(action, quantity)
+                trade = self.client.placeOrder(contract, order)
+                
+                print(f"Order placed: {action} {quantity} contracts of {contract_desc}")
+                
+                # Wait for fill
+                self.client.sleep(2)
+                
+                closed_count += 1
+                
+            except Exception as e:
+                print(f"Error closing option position: {e}")
+                continue
+        
+        print(f"\n=== CLOSURE SUMMARY ===")
+        print(f"Option positions closed: {closed_count}")
+        print(f"Total P&L: ${total_pnl:.2f}")
+        print("=" * 50)
+        
+        return closed_count, total_pnl
+
 
 
 if __name__ == "__main__":
     broker = IBTWSAPI()
     broker.connect()
-    broker.close_all_positions()
+    broker.close_all_option_positions("script_execution")
 
 

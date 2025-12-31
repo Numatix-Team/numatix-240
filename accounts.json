@@ -1,0 +1,17 @@
+{
+  "accounts": [
+    {
+      "nickname": "Vedansh",
+      "ibkr_account_id": "DU123456"
+    },
+    {
+      "nickname": "acc2",
+      "ibkr_account_id": "DU789012"
+    },
+    {
+      "nickname": "acc3",
+      "ibkr_account_id": "DU345678"
+    }
+  ]
+}
+

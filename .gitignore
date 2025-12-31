@@ -1,3 +1,7 @@
 venv/
 __pycache__/
 logs/
+not_used/
+*.pid
+*.status
+*.db
