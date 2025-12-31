@@ -506,7 +506,7 @@ class IBBroker(EWrapper, EClient):
         )
 
         # Wait until data arrives
-        timeout = 100
+        timeout = 500
         for _ in range(timeout):
             time.sleep(0.1)
             if req_id in self.historical_data:

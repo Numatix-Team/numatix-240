@@ -87,7 +87,7 @@ def create_position_entry(
         "bid": bid,
         "ask": ask,
         "last_price": entry_price,
-        "order_id_entry": order_id,
+        "order_id_entry": int(order_id) if order_id is not None else None,
         "order_id_exit": None,
         "last_update": now,
         "realized_pnl": 0.0,
@@ -200,8 +200,8 @@ def save_active_ids(position_open, atm_call_id, atm_put_id, otm_call_id, otm_put
     if otm_put_id:
         db.update_position(otm_put_id, {"active": 1})
 
-def update_position_in_json(updated_pos):
-    """Update position in database. Name kept for backward compatibility."""
+def update_position_in_db(updated_pos):
+    """Update position in database."""
     if updated_pos is None:
         return
     
@@ -216,15 +216,30 @@ def update_position_in_json(updated_pos):
     # Get account and symbol from position
     account = updated_pos.get("account")
     symbol = updated_pos.get("symbol")
+    pos_type = updated_pos.get("position_type", "UNKNOWN")
+    right = updated_pos.get("right", "")
+    strike = updated_pos.get("strike", 0)
     
     if account and symbol:
         # Use account+symbol specific database
         db = get_db(account, symbol)
         existing = db.get_position(pos_id)
         if existing:
+            # Show what's being updated
+            last_price = updated_pos.get("last_price")
+            unrealized = updated_pos.get("unrealized_pnl", 0) or 0
+            realized = updated_pos.get("realized_pnl", 0) or 0
+            qty = updated_pos.get("qty", 0)
+            last_price_str = f"${last_price:.2f}" if last_price is not None else "N/A"
+            print(f"[DB] Updating {pos_type} {right} @ Strike {strike} in {account}/{symbol} DB:")
+            print(f"[DB]   Last Price: {last_price_str}, Qty: {qty}")
+            print(f"[DB]   Realized PnL: ${realized:.2f}, Unrealized PnL: ${unrealized:.2f}")
             db.update_position(pos_id, updated_pos)
+            print(f"[DB] Update complete")
         else:
+            print(f"[DB] Inserting new {pos_type} {right} @ Strike {strike} in {account}/{symbol} DB")
             db.insert_position(updated_pos)
+            print(f"[DB] Insert complete")
     else:
         # Fallback: search all databases (less efficient)
         import glob

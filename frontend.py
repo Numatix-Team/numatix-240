@@ -9,6 +9,7 @@ from datetime import datetime
 import pytz
 import time
 from db.position_db import PositionDB
+from db.multi_account_db import MultiAccountDB
 from helpers.state_manager import (
     set_account_paused, set_account_stopped, 
     is_account_paused, is_account_stopped,
@@ -16,8 +17,8 @@ from helpers.state_manager import (
 )
 python_path = sys.executable
 
-# Database instance
-_db = PositionDB()
+# Database instance - use MultiAccountDB to query across all account+symbol databases
+_db = MultiAccountDB()
 
 # Eastern timezone
 EASTERN_TZ = pytz.timezone("US/Eastern")

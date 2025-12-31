@@ -2,7 +2,7 @@
     "broker": {
         "host": "127.0.0.1",
         "port": 7497,
-        "client_id": 2
+        "client_id": 1
     },
     "underlying": {
         "symbol": "XSP",
@@ -10,7 +10,7 @@
         "currency": "USD"
     },
     "expiry": {
-        "date": "20251222"
+        "date": "20251231"
     },
     "trade_parameters": {
         "call_quantity": 1,
@@ -21,7 +21,7 @@
         "exit_vwap_multiplier": 1.02,
         "take_profit_levels": [
             {
-                "pnl_percent": 0.3,
+                "pnl_percent": 0.1,
                 "exit_percent": 0.5
             },
             {
@@ -33,9 +33,9 @@
                 "exit_percent": 0.2
             }
         ],
-        "stop_loss": 0.3,
+        "stop_loss": 0.1,
         "max_bid_ask_spread": 1.05,
-        "strike_step": 1
+        "strike_step": 5
     },
     "time_controls": {
         "entry_start": "09:30",

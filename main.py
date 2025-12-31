@@ -1,4 +1,5 @@
 import os
+import math
 import json
 import time
 import random
@@ -149,14 +150,78 @@ class Strategy:
 
     # RESTORE ACTIVE POSITIONS
     def _load_active_ids(self):
-        active = load_active_ids(self.account, self.symbol)
-
-        self.position_open = active.get("position_open", False)
-        self.atm_call_id = active.get("atm_call_id")
-        self.atm_put_id = active.get("atm_put_id")
-        self.otm_call_id = active.get("otm_call_id")
-        self.otm_put_id = active.get("otm_put_id")
-
+        """Load active positions that match the current strategy's strike prices."""
+        # Calculate strikes using base_atm_price, strike_offset, and strike_step
+        if self.base_atm_price is not None:
+            # base_atm_price is already rounded to nearest strike_step
+            atm_with_offset = self.base_atm_price + self.strike_offset * self.strike_step
+            self.call_strike = atm_with_offset + self.atm_call_offset * self.strike_step
+            self.put_strike = atm_with_offset + self.atm_put_offset * self.strike_step
+            
+            if self.enable_hedges:
+                self.hedge_call_strike = atm_with_offset + self.hedge_call_offset * self.strike_step
+                self.hedge_put_strike = atm_with_offset + self.hedge_put_offset * self.strike_step
+            else:
+                self.hedge_call_strike = None
+                self.hedge_put_strike = None
+            
+            print(f"[LOAD] Calculated strikes: Call={self.call_strike}, Put={self.put_strike}")
+            if self.enable_hedges:
+                print(f"[LOAD] Hedge strikes: Call={self.hedge_call_strike}, Put={self.hedge_put_strike}")
+        else:
+            # If base_atm_price is not set, we can't calculate strikes yet
+            # Will be calculated in fetch_data() later
+            print(f"[LOAD] base_atm_price not set, skipping strike-based position loading")
+            self.position_open = False
+            self.atm_call_id = None
+            self.atm_put_id = None
+            self.otm_call_id = None
+            self.otm_put_id = None
+            return
+        
+        db = get_db(self.account, self.symbol)
+        all_active = db.get_active_positions(self.account, self.symbol)
+        
+        # Filter positions by matching strikes
+        atm_call_id = None
+        atm_put_id = None
+        otm_call_id = None
+        otm_put_id = None
+        
+        for pos in all_active:
+            pos_strike = pos.get("strike")
+            pos_type = pos.get("position_type", "")
+            pos_right = pos.get("right", "")
+            
+            # Check ATM call
+            if pos_type == "ATM" and pos_right == "C" and pos_strike == self.call_strike:
+                atm_call_id = pos["id"]
+                print(f"[LOAD] Found matching ATM Call position: ID={atm_call_id}, Strike={pos_strike}")
+            
+            # Check ATM put
+            elif pos_type == "ATM" and pos_right == "P" and pos_strike == self.put_strike:
+                atm_put_id = pos["id"]
+                print(f"[LOAD] Found matching ATM Put position: ID={atm_put_id}, Strike={pos_strike}")
+            
+            # Check hedge call (if enabled)
+            elif self.enable_hedges and pos_type == "OTM" and pos_right == "C" and pos_strike == self.hedge_call_strike:
+                otm_call_id = pos["id"]
+                print(f"[LOAD] Found matching Hedge Call position: ID={otm_call_id}, Strike={pos_strike}")
+            
+            # Check hedge put (if enabled)
+            elif self.enable_hedges and pos_type == "OTM" and pos_right == "P" and pos_strike == self.hedge_put_strike:
+                otm_put_id = pos["id"]
+                print(f"[LOAD] Found matching Hedge Put position: ID={otm_put_id}, Strike={pos_strike}")
+        
+        # Set the loaded IDs
+        self.atm_call_id = atm_call_id
+        self.atm_put_id = atm_put_id
+        self.otm_call_id = otm_call_id
+        self.otm_put_id = otm_put_id
+        
+        # Position is open if we have at least one ATM position
+        self.position_open = (atm_call_id is not None) or (atm_put_id is not None)
+        
         if self.position_open:
             self.position = {
                 "atm_call_id": self.atm_call_id,
@@ -164,6 +229,11 @@ class Strategy:
                 "otm_call_id": self.otm_call_id,
                 "otm_put_id": self.otm_put_id
             }
+            print(f"[LOAD] Active positions loaded: ATM_C={atm_call_id}, ATM_P={atm_put_id}, OTM_C={otm_call_id}, OTM_P={otm_put_id}")
+        else:
+            print(f"[LOAD] No matching active positions found for strikes: Call={self.call_strike}, Put={self.put_strike}")
+            self.position = None
+    
 
     # FETCH MARKET DATA
    
@@ -276,9 +346,9 @@ class Strategy:
 
         print(f"[Strategy] VWAP={self.vwap:.2f}")
 
-        # Push back to class
-        self.hist_df = df
-        self.hist_df.to_csv("check_Arya.csv", index=False)
+        # # Push back to class
+        # self.hist_df = df
+        # self.hist_df.to_csv("check_Arya.csv", index=False)
 
         return True
     # Utility
@@ -302,7 +372,10 @@ class Strategy:
         now = datetime.now(self.tz).time()
         if not (self.entry_start <= now <= self.entry_end):
             return {"action": "NONE"}
+        print(f"[SIGNAL] Fetching bid/ask prices for signal generation...")
+        print(f"[SIGNAL]   CALL: {self.symbol} {self.expiry} {self.call_strike}C")
         cp = self.broker.get_option_premium(self.symbol, self.expiry, self.call_strike, "C")
+        print(f"[SIGNAL]   PUT: {self.symbol} {self.expiry} {self.put_strike}P")
         pp = self.broker.get_option_premium(self.symbol, self.expiry, self.put_strike, "P")
         c_price = self._extract_price(cp)
         p_price = self._extract_price(pp)
@@ -481,35 +554,54 @@ class Strategy:
     def _update_live_leg(self, pos_id, test_mode=False):
         pos = get_position_by_id(pos_id, self.account, self.symbol)
         if pos is None or not pos.get("active", False):
+            if pos is None:
+                print(f"[UPDATE] Position {pos_id} not found in database")
+            else:
+                print(f"[UPDATE] Position {pos_id} is not active, skipping update")
             return
+
+        pos_type = pos.get("position_type", "UNKNOWN")
+        right = pos.get("right", "")
+        strike = pos.get("strike", 0)
+        side = pos.get("side", "")
+        print(f"[UPDATE] Updating {pos_type} {right} @ Strike {strike} ({side}) - ID: {pos_id[:20]}...")
+        print(f"[UPDATE] Fetching bid/ask prices from broker for {pos['symbol']} {pos['expiry']} {pos['strike']}{pos['right']}...")
 
         data = self.broker.get_option_premium(
             pos["symbol"], pos["expiry"], pos["strike"], pos["right"], test_mode=test_mode
         )
 
         if data is None:
-            print(f"[UPDATE] No data returned for position {pos_id}, skipping update")
+            print(f"[UPDATE] SKIPPED: No data returned from IBKR for {pos_type} {right} @ Strike {strike} (ID: {pos_id})")
+            print(f"[UPDATE] Reason: IBKR did not return any market data. Will retry on next iteration.")
             return
 
         bid = data.get("bid")
         ask = data.get("ask")
+        last = data.get("last")
+        mid = data.get("mid")
+        print(f"[UPDATE] Received market data: bid={bid}, ask={ask}, last={last}, mid={mid}")
 
-        # Use last price by default, fallback to mid price if last is not available
-        last_price = data.get("last")
-        if last_price is None:
-            # If last is not available, try mid price (calculated from bid/ask if available)
-            if bid is not None and ask is not None:
-                last_price = (bid + ask) / 2  # Mid price
-            else:
-                last_price = data.get("mid")  # Pre-calculated mid if available
+        # Use bid for SELL positions, ask for BUY positions (for PnL calculation)
+        if pos["side"] == "SELL":
+            last_price = bid
+            price_source = "bid"
+            missing_field = "bid" if bid is None else None
+        else:
+            last_price = ask
+            price_source = "ask"
+            missing_field = "ask" if ask is None else None
 
         # Check if we have a valid price before proceeding
         if last_price is None:
-            print(f"[UPDATE] No price data available for position {pos_id}, skipping update")
+            print(f"[UPDATE] SKIPPED: Missing required price data for {pos_type} {right} @ Strike {strike} (ID: {pos_id})")
+            print(f"[UPDATE] Reason: {price_source.upper()} price is None (required for {pos['side']} position PnL calculation). Will retry on next iteration.")
             return
 
         entry = pos.get("entry_price")
         qty = pos.get("qty")
+        old_last_price = pos.get("last_price")
+        old_unrealized = pos.get("unrealized_pnl", 0.0) or 0.0
 
         # Additional None checks for entry and qty
         if entry is None:
@@ -523,35 +615,102 @@ class Strategy:
         # -----------------------------
         # Calculate unrealized PnL (only for remaining quantity)
         # -----------------------------
+        print(f"[UPDATE] PnL Calculation Details:")
+        print(f"[UPDATE]   Side: {side}")
+        print(f"[UPDATE]   Entry Price: ${entry:.2f}")
+        print(f"[UPDATE]   Current Price: ${last_price:.2f}")
+        print(f"[UPDATE]   Quantity: {qty}")
+        
         if pos["side"] == "SELL":
+            # For SELL positions: profit when price goes down (you sold high, can buy back low)
+            # PnL = (entry_price - current_price) * qty
             unrealized_pnl = (entry - last_price) * qty
+            price_diff = entry - last_price
+            print(f"[UPDATE]   SELL Position Formula: (Entry - Current) * Qty")
+            print(f"[UPDATE]   Calculation: (${entry:.2f} - ${last_price:.2f}) * {qty} = ${unrealized_pnl:.2f}")
+            if price_diff > 0:
+                print(f"[UPDATE]   → Price dropped ${price_diff:.2f}, you PROFIT ${unrealized_pnl:.2f} (can buy back cheaper)")
+            elif price_diff < 0:
+                print(f"[UPDATE]   → Price rose ${abs(price_diff):.2f}, you LOSE ${abs(unrealized_pnl):.2f} (must buy back more expensive)")
+            else:
+                print(f"[UPDATE]   → Price unchanged, PnL = $0.00")
         else:
+            # For BUY positions: profit when price goes up (you bought low, can sell high)
+            # PnL = (current_price - entry_price) * qty
             unrealized_pnl = (last_price - entry) * qty
+            price_diff = last_price - entry
+            print(f"[UPDATE]   BUY Position Formula: (Current - Entry) * Qty")
+            print(f"[UPDATE]   Calculation: (${last_price:.2f} - ${entry:.2f}) * {qty} = ${unrealized_pnl:.2f}")
+            if price_diff > 0:
+                print(f"[UPDATE]   → Price rose ${price_diff:.2f}, you PROFIT ${unrealized_pnl:.2f} (can sell higher)")
+            elif price_diff < 0:
+                print(f"[UPDATE]   → Price dropped ${abs(price_diff):.2f}, you LOSE ${abs(unrealized_pnl):.2f} (worth less than you paid)")
+            else:
+                print(f"[UPDATE]   → Price unchanged, PnL = $0.00")
 
         existing_realized_pnl = pos.get("realized_pnl", 0.0) or 0.0
 
         pos["bid"] = bid
         pos["ask"] = ask
-        pos["last_price"] = last_price
+        pos["last_price"] = last  # Store actual last price in database (we use bid/ask for PnL calculation)
         pos["unrealized_pnl"] = unrealized_pnl
         pos["realized_pnl"] = existing_realized_pnl  # Keep existing realized PnL from partial exits
         pos["last_update"] = datetime.now(self.tz).isoformat()
 
-        update_position_in_json(pos)
+        # Safe formatting for None values
+        bid_str = f"${bid:.2f}" if bid is not None else "N/A"
+        ask_str = f"${ask:.2f}" if ask is not None else "N/A"
+        last_str = f"${last:.2f}" if last is not None else "N/A"
+        print(f"[UPDATE] Price Data: Bid={bid_str}, Ask={ask_str}, Last={last_str}, Using=${last_price:.2f} (source: {price_source}) for PnL")
+        print(f"[UPDATE] PnL Summary: Realized=${existing_realized_pnl:.2f}, Unrealized=${unrealized_pnl:.2f} (was ${old_unrealized:.2f})")
+        if old_last_price:
+            price_change = last_price - old_last_price
+            print(f"[UPDATE] Price Change: ${price_change:.2f} (${old_last_price:.2f} → ${last_price:.2f})")
+
+        print(f"[UPDATE] Saving to database...")
+        update_position_in_db(pos)
+        print(f"[UPDATE] Database updated for {pos_type} {right} @ Strike {strike}")
 
     def _partial_exit_atm(self, exit_fraction, reason):
         print(f"[TP] Partial exit {exit_fraction*100:.0f}% → {reason}")
 
-        # Calculate exit qty from ORIGINAL qty
-        call_exit_qty = int(round(self.init_call_qty * exit_fraction))
-        put_exit_qty  = int(round(self.init_put_qty * exit_fraction))
+        # Get actual available quantities from database positions
+        call_available_qty = 0
+        put_available_qty = 0
+        
+        if self.atm_call_id:
+            call_pos = get_position_by_id(self.atm_call_id, self.account, self.symbol)
+            if call_pos:
+                call_available_qty = call_pos.get("qty", 0)
+        
+        if self.atm_put_id:
+            put_pos = get_position_by_id(self.atm_put_id, self.account, self.symbol)
+            if put_pos:
+                put_available_qty = put_pos.get("qty", 0)
 
-        # Cap by remaining qty
-        call_exit_qty = min(call_exit_qty, self.curr_call_qty)
-        put_exit_qty  = min(put_exit_qty, self.curr_put_qty)
+        # Calculate exit qty from ORIGINAL qty
+        call_exit_qty = int(math.ceil(self.init_call_qty * exit_fraction))
+        put_exit_qty  = int(math.ceil(self.init_put_qty * exit_fraction))
+
+        # Cap by remaining qty (use both in-memory and database quantities for safety)
+        call_exit_qty = min(call_exit_qty, self.curr_call_qty, call_available_qty)
+        put_exit_qty  = min(put_exit_qty, self.curr_put_qty, put_available_qty)
 
         if call_exit_qty <= 0 or put_exit_qty <= 0:
             print("[TP] Nothing left to exit")
+            return
+        
+        # Validate that exit quantities don't exceed available quantities
+        if call_exit_qty > call_available_qty:
+            print(f"[TP] WARNING: Call exit qty ({call_exit_qty}) exceeds available qty ({call_available_qty}). Capping to available.")
+            call_exit_qty = call_available_qty
+        
+        if put_exit_qty > put_available_qty:
+            print(f"[TP] WARNING: Put exit qty ({put_exit_qty}) exceeds available qty ({put_available_qty}). Capping to available.")
+            put_exit_qty = put_available_qty
+        
+        if call_exit_qty <= 0 or put_exit_qty <= 0:
+            print("[TP] Nothing left to exit after validation")
             return
 
         # ---- CALL ----
@@ -576,35 +735,135 @@ class Strategy:
             if call_pos:
                 entry = call_pos.get("entry_price")
                 exit_price = call_resp.get("fill_price") if call_resp else None
+                old_qty = call_pos.get("qty", 0)
+                old_realized = call_pos.get("realized_pnl", 0) or 0
+                
+                print(f"[TP] CALL Position Update:")
+                print(f"[TP]   Old Qty: {old_qty}, Exit Qty: {call_exit_qty}, New Qty: {self.curr_call_qty}")
+                print(f"[TP]   Entry Price: ${entry:.2f}, Exit Price: ${exit_price:.2f}")
                 
                 if entry is not None and exit_price is not None:
                     # Calculate realized PnL for partial exit (SELL side)
                     partial_realized_pnl = (entry - exit_price) * call_exit_qty
-                    call_pos["realized_pnl"] = (call_pos.get("realized_pnl", 0) or 0) + partial_realized_pnl
+                    new_realized = old_realized + partial_realized_pnl
+                    call_pos["realized_pnl"] = new_realized
+                    print(f"[TP]   Realized PnL: ${old_realized:.2f} + ${partial_realized_pnl:.2f} = ${new_realized:.2f}")
                 
                 call_pos["qty"] = self.curr_call_qty
                 call_pos["last_update"] = datetime.now(self.tz).isoformat()
-                update_position_in_json(call_pos)
+                
+                # Check if position should be marked as closed (quantity reached 0)
+                if self.curr_call_qty <= 0:
+                    call_pos["active"] = False
+                    call_pos["exit_time"] = datetime.now(self.tz).isoformat()
+                    call_pos["unrealized_pnl"] = 0.0
+                    print(f"[TP] CALL position fully closed (qty=0), marking as inactive")
+                
+                # Recalculate unrealized PnL immediately with new quantity
+                # Get current market price for recalculation
+                if self.curr_call_qty > 0:
+                    print(f"[TP]   Fetching current bid/ask prices for remaining CALL position...")
+                    data = self.broker.get_option_premium(
+                        call_pos["symbol"], call_pos["expiry"], call_pos["strike"], call_pos["right"], test_mode=False
+                    )
+                    if data:
+                        bid = data.get("bid")
+                        ask = data.get("ask")
+                        last = data.get("last")
+                        
+                        # Use BID for SELL positions (call_pos is SELL side)
+                        last_price = bid
+                        
+                        if last_price is not None:
+                            # Recalculate unrealized PnL with remaining quantity (SELL side)
+                            old_unrealized = call_pos.get("unrealized_pnl", 0) or 0
+                            call_pos["unrealized_pnl"] = (entry - last_price) * self.curr_call_qty
+                            call_pos["last_price"] = last  # Store actual last price in database
+                            call_pos["bid"] = bid
+                            call_pos["ask"] = ask
+                            last_str = f"${last:.2f}" if last is not None else "N/A"
+                            print(f"[TP]   Unrealized PnL: ${old_unrealized:.2f} → ${call_pos['unrealized_pnl']:.2f} (based on new qty {self.curr_call_qty})")
+                            print(f"[TP]   Using Price: ${last_price:.2f} (bid) for PnL, Storing Last: {last_str} in DB")
+                        else:
+                            print(f"[TP] Could not get current price for unrealized PnL recalculation")
+                    else:
+                        print(f"[TP] No market data returned for unrealized PnL recalculation")
+                print(f"[TP] Updating CALL position in database...")
+                update_position_in_db(call_pos)
+                print(f"[TP] CALL position updated in database")
 
         if self.atm_put_id:
             put_pos = get_position_by_id(self.atm_put_id, self.account, self.symbol)
             if put_pos:
                 entry = put_pos.get("entry_price")
                 exit_price = put_resp.get("fill_price") if put_resp else None
+                old_qty = put_pos.get("qty", 0)
+                old_realized = put_pos.get("realized_pnl", 0) or 0
+                
+                print(f"[TP] PUT Position Update:")
+                print(f"[TP]   Old Qty: {old_qty}, Exit Qty: {put_exit_qty}, New Qty: {self.curr_put_qty}")
+                print(f"[TP]   Entry Price: ${entry:.2f}, Exit Price: ${exit_price:.2f}")
                 
                 if entry is not None and exit_price is not None:
                     # Calculate realized PnL for partial exit (SELL side)
                     partial_realized_pnl = (entry - exit_price) * put_exit_qty
-                    put_pos["realized_pnl"] = (put_pos.get("realized_pnl", 0) or 0) + partial_realized_pnl
+                    new_realized = old_realized + partial_realized_pnl
+                    put_pos["realized_pnl"] = new_realized
+                    print(f"[TP]   Realized PnL: ${old_realized:.2f} + ${partial_realized_pnl:.2f} = ${new_realized:.2f}")
                 
                 put_pos["qty"] = self.curr_put_qty
                 put_pos["last_update"] = datetime.now(self.tz).isoformat()
-                update_position_in_json(put_pos)
+                
+                # Check if position should be marked as closed (quantity reached 0)
+                if self.curr_put_qty <= 0:
+                    put_pos["active"] = False
+                    put_pos["exit_time"] = datetime.now(self.tz).isoformat()
+                    put_pos["unrealized_pnl"] = 0.0
+                    print(f"[TP] PUT position fully closed (qty=0), marking as inactive")
+                
+                # Recalculate unrealized PnL immediately with new quantity
+                # Get current market price for recalculation
+                if self.curr_put_qty > 0:
+                    print(f"[TP]   Fetching current bid/ask prices for remaining PUT position...")
+                    data = self.broker.get_option_premium(
+                        put_pos["symbol"], put_pos["expiry"], put_pos["strike"], put_pos["right"], test_mode=False
+                    )
+                    if data:
+                        bid = data.get("bid")
+                        ask = data.get("ask")
+                        last = data.get("last")
+                        
+                        # Use BID for SELL positions (put_pos is SELL side)
+                        last_price = bid
+                        
+                        if last_price is not None:
+                            # Recalculate unrealized PnL with remaining quantity (SELL side)
+                            old_unrealized = put_pos.get("unrealized_pnl", 0) or 0
+                            put_pos["unrealized_pnl"] = (entry - last_price) * self.curr_put_qty
+                            put_pos["last_price"] = last  # Store actual last price in database
+                            put_pos["bid"] = bid
+                            put_pos["ask"] = ask
+                            last_str = f"${last:.2f}" if last is not None else "N/A"
+                            print(f"[TP]   Unrealized PnL: ${old_unrealized:.2f} → ${put_pos['unrealized_pnl']:.2f} (based on new qty {self.curr_put_qty})")
+                            print(f"[TP]   Using Price: ${last_price:.2f} (bid) for PnL, Storing Last: {last_str} in DB")
+                        else:
+                            print(f"[TP] Could not get current price for unrealized PnL recalculation")
+                    else:
+                        print(f"[TP] No market data returned for unrealized PnL recalculation")
+                print(f"[TP] Updating PUT position in database...")
+                update_position_in_db(put_pos)
+                print(f"[TP] PUT position updated in database")
 
         print(
             f"[TP] Remaining qty → CALL {self.curr_call_qty}, "
             f"PUT {self.curr_put_qty}"
         )
+        
+        # Check if both positions are fully closed and mark position as closed
+        if self.curr_call_qty <= 0 and self.curr_put_qty <= 0:
+            print("[TP] All quantities exited via partial close - marking position as closed")
+            self.position_open = False
+            save_active_ids(False, None, None, None, None, self.account, self.symbol)
 
 
     # POSITION MANAGEMENT
@@ -619,10 +878,20 @@ class Strategy:
                 return None
 
             # Update all legs
-            if self.atm_call_id: self._update_live_leg(self.atm_call_id)
-            if self.atm_put_id: self._update_live_leg(self.atm_put_id)
-            if self.enable_hedges and self.otm_call_id: self._update_live_leg(self.otm_call_id)
-            if self.enable_hedges and self.otm_put_id: self._update_live_leg(self.otm_put_id)
+            print(f"[MANAGE] Updating all position legs...")
+            if self.atm_call_id:
+                print(f"[MANAGE] → Updating ATM CALL leg...")
+                self._update_live_leg(self.atm_call_id)
+            if self.atm_put_id:
+                print(f"[MANAGE] → Updating ATM PUT leg...")
+                self._update_live_leg(self.atm_put_id)
+            if self.enable_hedges and self.otm_call_id:
+                print(f"[MANAGE] → Updating OTM CALL hedge...")
+                self._update_live_leg(self.otm_call_id)
+            if self.enable_hedges and self.otm_put_id:
+                print(f"[MANAGE] → Updating OTM PUT hedge...")
+                self._update_live_leg(self.otm_put_id)
+            print(f"[MANAGE] All legs updated")
 
             # Fetch updated ATM legs
             ac = get_position_by_id(self.atm_call_id, self.account, self.symbol)
@@ -633,15 +902,58 @@ class Strategy:
                 time_mod.sleep(poll_interval)
                 continue
 
-            # Combined valuations
-            current = ac["last_price"] + ap["last_price"]
-            entry_total = ac["entry_price"] + ap["entry_price"]
-
-            pnl_pct = (entry_total - current) / entry_total
-
+            # Calculate total unrealized PnL (including hedges if enabled)
             unrealized_pnl_total = (ac.get("unrealized_pnl", 0) or 0) + (ap.get("unrealized_pnl", 0) or 0)
+            
+            # Calculate net entry value (total capital at risk)
+            # For SELL positions: we received entry_price * qty
+            # For BUY positions: we paid entry_price * qty
+            # Net entry = what we received from SELL + what we paid for BUY (total capital at risk)
+            sell_received = 0
+            buy_paid = 0
+            
+            if ac.get("side") == "SELL":
+                sell_received += ac["entry_price"] * ac.get("qty", 0)
+            else:
+                buy_paid += ac["entry_price"] * ac.get("qty", 0)
+            
+            if ap.get("side") == "SELL":
+                sell_received += ap["entry_price"] * ap.get("qty", 0)
+            else:
+                buy_paid += ap["entry_price"] * ap.get("qty", 0)
 
-            print(f"[MANAGE] ATM Combined Unrealized PnL: ${unrealized_pnl_total:.2f} USD "
+            # Include hedges if enabled
+            if self.enable_hedges:
+                hc = get_position_by_id(self.otm_call_id, self.account, self.symbol) if self.otm_call_id else None
+                hp = get_position_by_id(self.otm_put_id, self.account, self.symbol) if self.otm_put_id else None
+                
+                if hc:
+                    unrealized_pnl_total += (hc.get("unrealized_pnl", 0) or 0)
+                    if hc.get("side") == "SELL":
+                        sell_received += hc["entry_price"] * hc.get("qty", 0)
+                    else:
+                        buy_paid += hc["entry_price"] * hc.get("qty", 0)
+                    print(f"[MANAGE] Including hedge call: Entry=${hc['entry_price']:.2f}, Unrealized=${hc.get('unrealized_pnl', 0) or 0:.2f}")
+                
+                if hp:
+                    unrealized_pnl_total += (hp.get("unrealized_pnl", 0) or 0)
+                    if hp.get("side") == "SELL":
+                        sell_received += hp["entry_price"] * hp.get("qty", 0)
+                    else:
+                        buy_paid += hp["entry_price"] * hp.get("qty", 0)
+                    print(f"[MANAGE] Including hedge put: Entry=${hp['entry_price']:.2f}, Unrealized=${hp.get('unrealized_pnl', 0) or 0:.2f}")
+
+            # Net entry = total capital at risk = what we received + what we paid
+            # This represents the total value of positions we're managing
+            net_entry = sell_received + buy_paid if (sell_received + buy_paid) > 0 else 1
+            
+            # Calculate PnL percentage: unrealized PnL / net entry value
+            # This gives us the percentage return on our net capital
+            pnl_pct = unrealized_pnl_total / net_entry if net_entry > 0 else 0
+
+            print(f"[MANAGE] SELL Received: ${sell_received:.2f}, BUY Paid: ${buy_paid:.2f}")
+            print(f"[MANAGE] Net Entry Value: ${net_entry:.2f} (total capital at risk)")
+            print(f"[MANAGE] Combined Unrealized PnL: ${unrealized_pnl_total:.2f} USD "
                 f"({pnl_pct*100:.2f}%)")
 
             now = datetime.now(self.tz).time()
@@ -651,13 +963,23 @@ class Strategy:
             # --------------------
             vwap_exit_level = self.vwap * self.exit_vwap_mult
 
-            print(f"[MANAGE] VWAP EXIT → current: {current:.4f}, "
+            # Calculate current combined premium for VWAP exit check (using bid for SELL positions)
+            current_combined = ac.get("bid", ac.get("last_price", 0)) + ap.get("bid", ap.get("last_price", 0))
+            if self.enable_hedges:
+                hc = get_position_by_id(self.otm_call_id, self.account, self.symbol) if self.otm_call_id else None
+                hp = get_position_by_id(self.otm_put_id, self.account, self.symbol) if self.otm_put_id else None
+                if hc:
+                    current_combined += hc.get("ask", hc.get("last_price", 0))  # BUY position uses ask
+                if hp:
+                    current_combined += hp.get("ask", hp.get("last_price", 0))  # BUY position uses ask
+            
+            print(f"[MANAGE] VWAP EXIT → current: {current_combined:.4f}, "
                 f"required: > {vwap_exit_level:.4f} "
                 f"(vwap={self.vwap:.4f}, mult={self.exit_vwap_mult})")
 
-            if current > vwap_exit_level:
-                print("[MANAGE] VWAP EXIT Triggered")
-                return self.exit_position("VWAP EXIT")
+            # if current > vwap_exit_level:
+            #     print("[MANAGE] VWAP EXIT Triggered")
+            #     return self.exit_position("VWAP EXIT")
 
 
             # --------------------
@@ -765,25 +1087,36 @@ class Strategy:
 
         entry = pos["entry_price"]
         qty = pos["qty"]
+        existing_realized_pnl = pos.get("realized_pnl", 0.0) or 0.0  # Get existing realized PnL from partial exits
 
         if entry is not None and close_price is not None:
             if pos["side"] == "SELL":
-                realized_pnl = (entry - close_price) * qty
+                # Calculate realized PnL for remaining quantity
+                remaining_realized_pnl = (entry - close_price) * qty
             else:
-                realized_pnl = (close_price - entry) * qty
+                remaining_realized_pnl = (close_price - entry) * qty
         else:
-            realized_pnl = 0
+            remaining_realized_pnl = 0
+
+        # Total realized PnL = existing (from partial exits) + remaining (from full close)
+        total_realized_pnl = existing_realized_pnl + remaining_realized_pnl
 
         pos["active"] = False
         pos["exit_time"] = now
         pos["close_price"] = close_price
-        pos["order_id_exit"] = resp.get("order_id")
+        order_id_exit = resp.get("order_id")
+        pos["order_id_exit"] = int(order_id_exit) if order_id_exit is not None else None
         pos["qty"] = 0  # Set quantity to 0 when completely closed
-        pos["realized_pnl"] = realized_pnl
+        pos["realized_pnl"] = total_realized_pnl  # Total realized PnL including partial exits
         pos["unrealized_pnl"] = 0.0  # No unrealized PnL for closed positions
         pos["last_update"] = now
+        
+        print(f"[CLOSE] Closing {pos.get('position_type', '')} {pos.get('right', '')} @ Strike {pos.get('strike', 0)}")
+        print(f"[CLOSE]   Entry: ${entry:.2f}, Close: ${close_price:.2f}, Qty: {qty}")
+        print(f"[CLOSE]   Existing Realized: ${existing_realized_pnl:.2f}, Remaining Realized: ${remaining_realized_pnl:.2f}")
+        print(f"[CLOSE]   Total Realized PnL: ${total_realized_pnl:.2f}")
 
-        update_position_in_json(pos)
+        update_position_in_db(pos)
 
 
     # TEST MODE
@@ -879,7 +1212,7 @@ class Strategy:
             partial_realized_pnl = (entry - exit_price) * partial_exit_qty
             call_pos["qty"] = self.curr_call_qty
             call_pos["realized_pnl"] = (call_pos.get("realized_pnl", 0) or 0) + partial_realized_pnl
-            update_position_in_json(call_pos)
+            update_position_in_db(call_pos)
         
         if put_pos:
             entry = put_pos["entry_price"]
@@ -887,7 +1220,7 @@ class Strategy:
             partial_realized_pnl = (entry - exit_price) * partial_exit_qty
             put_pos["qty"] = self.curr_put_qty
             put_pos["realized_pnl"] = (put_pos.get("realized_pnl", 0) or 0) + partial_realized_pnl
-            update_position_in_json(put_pos)
+            update_position_in_db(put_pos)
 
         print(f"[TEST] Remaining quantities: Call={self.curr_call_qty}, Put={self.curr_put_qty}")
         print(f"[TEST] Positions still active: {self.position_open}")
