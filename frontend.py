@@ -254,13 +254,11 @@ def edit_config_page():
     with col3:
         tp["strike_step"] = st.number_input("Strike Step", value=tp["strike_step"])
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     with col1:
-        tp["atm_call_offset"] = st.number_input("ATM Call Offset", value=tp["atm_call_offset"])
-    with col2:
-        tp["atm_put_offset"] = st.number_input("ATM Put Offset", value=tp["atm_put_offset"])
-    with col3:
         tp["max_bid_ask_spread"] = st.number_input("Max Bid/Ask Spread", value=tp["max_bid_ask_spread"])
+    with col2:
+        st.write("")  # Empty column for layout
 
     col1, col2, col3 = st.columns(3)
     with col1:

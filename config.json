@@ -15,8 +15,6 @@
     "trade_parameters": {
         "call_quantity": 1,
         "put_quantity": 1,
-        "atm_call_offset": 1,
-        "atm_put_offset": 1,
         "entry_vwap_multiplier": 0.99,
         "exit_vwap_multiplier": 1.02,
         "take_profit_levels": [

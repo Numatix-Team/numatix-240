@@ -499,7 +499,7 @@ class IBBroker(EWrapper, EClient):
             duration,            # how far back
             bar_size,            # candle size
             "TRADES",            # data type
-            0,                   # useRTH=0 => include pre/post market
+            1,                   # useRTH=0 => include pre/post market
             1,                   # formatDate=1 => string dates
             False,               # keepUpToDate
             []

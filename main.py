@@ -113,8 +113,6 @@ class Strategy:
         tp = cfg["trade_parameters"]
         self.call_qty = tp["call_quantity"]
         self.put_qty = tp["put_quantity"]
-        self.atm_call_offset = tp["atm_call_offset"]
-        self.atm_put_offset = tp["atm_put_offset"]
         self.entry_vwap_mult = tp["entry_vwap_multiplier"]
         self.exit_vwap_mult = tp["exit_vwap_multiplier"]
         self.tp_levels = []
@@ -157,12 +155,14 @@ class Strategy:
         if self.base_atm_price is not None:
             # base_atm_price is already rounded to nearest strike_step
             atm_with_offset = self.base_atm_price + self.strike_offset * self.strike_step
-            self.call_strike = atm_with_offset + self.atm_call_offset * self.strike_step
-            self.put_strike = atm_with_offset + self.atm_put_offset * self.strike_step
+            # Call and put strikes are the same as ATM (no offset)
+            self.call_strike = atm_with_offset
+            self.put_strike = atm_with_offset
             
             if self.enable_hedges:
-                self.hedge_call_strike = atm_with_offset + self.hedge_call_offset * self.strike_step
-                self.hedge_put_strike = atm_with_offset + self.hedge_put_offset * self.strike_step
+                # Hedges use current ATM price (base_atm_price) with hedge offset
+                self.hedge_call_strike = self.base_atm_price + self.hedge_call_offset * self.strike_step
+                self.hedge_put_strike = self.base_atm_price + self.hedge_put_offset * self.strike_step
             else:
                 self.hedge_call_strike = None
                 self.hedge_put_strike = None
@@ -290,12 +290,14 @@ class Strategy:
         # Apply strike offset: strike = ATM + strike_offset
         atm_with_offset = atm + self.strike_offset * self.strike_step
         self.atm = atm_with_offset
-        self.call_strike = atm_with_offset + self.atm_call_offset * self.strike_step
-        self.put_strike = atm_with_offset + self.atm_put_offset * self.strike_step
+        # Call and put strikes are the same as ATM (no offset)
+        self.call_strike = atm_with_offset
+        self.put_strike = atm_with_offset
 
         if self.enable_hedges:
-            self.hedge_call_strike = atm_with_offset + self.hedge_call_offset * self.strike_step
-            self.hedge_put_strike = atm_with_offset + self.hedge_put_offset * self.strike_step
+            # Hedges use current ATM price (atm) with hedge offset
+            self.hedge_call_strike = atm + self.hedge_call_offset * self.strike_step
+            self.hedge_put_strike = atm + self.hedge_put_offset * self.strike_step
 
         print(f"[Strategy] Offset={self.strike_offset}, Base_ATM={atm}, ATM={atm_with_offset}, CALL={self.call_strike}, PUT={self.put_strike}")
 
@@ -357,24 +359,34 @@ class Strategy:
         # Ensure numeric (very important with live feeds)
         df["combined_premium"] = pd.to_numeric(df["combined_premium"], errors="coerce")
         df["combined_volume"] = pd.to_numeric(df["combined_volume"], errors="coerce")
-        # Turnover
+        
+        # Debug: Check for NaN or invalid values
+        nan_premium = df["combined_premium"].isna().sum()
+        nan_volume = df["combined_volume"].isna().sum()
+        if nan_premium > 0 or nan_volume > 0:
+            print(f"[VWAP] WARNING: Found {nan_premium} NaN in combined_premium, {nan_volume} NaN in combined_volume")
+        
+        # Turnover = combined_premium * combined_volume
         df["turnover"] = df["combined_premium"] * df["combined_volume"]
 
-        # Cumulative values
-        df["cum_turnover"] = df["turnover"].cumsum()
-        df["cum_volume"] = df["combined_volume"].cumsum()
-
-        # VWAP column (safe division)
-        df["vwap"] = df["cum_turnover"] / df["cum_volume"].replace(0, pd.NA)
-
-        # Total VWAP for session
+        # Total VWAP for session: sum(turnover) / sum(volume)
         tot_vol = df["combined_volume"].sum()
         if tot_vol == 0:
+            print(f"[VWAP] ERROR: Total volume is zero, cannot calculate VWAP")
             return False
 
-        self.vwap = float(df["turnover"].sum() / tot_vol)
+        tot_turnover = df["turnover"].sum()
+        self.vwap = float(tot_turnover / tot_vol)
 
-        print(f"[Strategy] VWAP={self.vwap:.2f}")
+        # Debug logging
+        print(f"[VWAP] Calculation:")
+        print(f"[VWAP]   Total turnover: {tot_turnover:.2f}")
+        print(f"[VWAP]   Total volume: {tot_vol:.0f}")
+        print(f"[VWAP]   VWAP = {tot_turnover:.2f} / {tot_vol:.0f} = {self.vwap:.4f}")
+        print(f"[VWAP]   Data points: {len(df)} bars")
+        if len(df) > 0:
+            print(f"[VWAP]   Combined premium range: {df['combined_premium'].min():.4f} to {df['combined_premium'].max():.4f}")
+            print(f"[VWAP]   Combined volume range: {df['combined_volume'].min():.0f} to {df['combined_volume'].max():.0f}")
 
         # # Push back to class
         # self.hist_df = df
@@ -401,22 +413,31 @@ class Strategy:
     def generate_signals(self):
         now = datetime.now(self.tz).time()
         if not (self.entry_start <= now <= self.entry_end):
+            # Log signal even when outside entry window
+            self.log_signal("OUTSIDE_ENTRY_WINDOW", None)
             return {"action": "NONE"}
         print(f"[SIGNAL] Fetching bid/ask prices for signal generation...")
         print(f"[SIGNAL]   CALL: {self.symbol} {self.expiry} {self.call_strike}C")
         cp = self.broker.get_option_premium(self.symbol, self.expiry, self.call_strike, "C")
         print(f"[SIGNAL]   PUT: {self.symbol} {self.expiry} {self.put_strike}P")
         pp = self.broker.get_option_premium(self.symbol, self.expiry, self.put_strike, "P")
+        
+        # Debug: Show raw price data
+        print(f"[SIGNAL] Call premium data: bid={cp.get('bid')}, ask={cp.get('ask')}, last={cp.get('last')}, mid={cp.get('mid')}")
+        print(f"[SIGNAL] Put premium data: bid={pp.get('bid')}, ask={pp.get('ask')}, last={pp.get('last')}, mid={pp.get('mid')}")
+        
         c_price = self._extract_price(cp)
         p_price = self._extract_price(pp)
-        print(c_price,p_price)
+        
+        print(f"[SIGNAL] Extracted prices: call={c_price}, put={p_price}")
 
         if c_price is None or p_price is None:
+            print(f"[SIGNAL] ERROR: Missing price data (call={c_price}, put={p_price})")
             self.log_signal("NONE", None)
             return {"action": "NONE"}
 
         combined = c_price + p_price
-        print(combined)
+        print(f"[SIGNAL] Combined premium: {combined:.4f} (call {c_price:.4f} + put {p_price:.4f})")
 
         if any([
             self._spread(cp) is None,
@@ -424,13 +445,30 @@ class Strategy:
             self._spread(cp) > self.max_spread,
             self._spread(pp) > self.max_spread
         ]):
+            # Log signal when skipped due to spread
+            self.log_signal("SKIPPED_DUE_TO_SPREAD", combined)
             return {"action": "SKIPPED DUE TO SPREAD"}
 
         threshold = self.vwap * self.entry_vwap_mult
 
-        if not self.position_open and combined < threshold:
+        # Debug logging for entry condition
+        print(f"[SIGNAL] Entry condition check:")
+        print(f"[SIGNAL]   Combined premium: {combined:.4f}")
+        print(f"[SIGNAL]   VWAP: {self.vwap:.4f}")
+        print(f"[SIGNAL]   Threshold (VWAP * {self.entry_vwap_mult}): {threshold:.4f}")
+        print(f"[SIGNAL]   Condition: combined > vwap? {combined > self.vwap}")
+        print(f"[SIGNAL]   Position open: {self.position_open}")
+
+        # Enter when combined premium is ABOVE VWAP (for selling straddle, we want high premiums)
+        if not self.position_open and combined > self.vwap:
+            # Log signal when SELL_STRADDLE is triggered
+            self.log_signal("SELL_STRADDLE", combined)
+            print(f"[SIGNAL] ✓ ENTRY TRIGGERED: combined ({combined:.4f}) > vwap ({self.vwap:.4f})")
             return {"action": "SELL_STRADDLE", "combined": combined}
 
+        # Log signal when no action is taken
+        if not self.position_open:
+            print(f"[SIGNAL] ✗ NO ENTRY: combined ({combined:.4f}) <= vwap ({self.vwap:.4f})")
         self.log_signal("NONE", combined)
         return {"action": "NONE"}
 
@@ -1534,6 +1572,10 @@ class Strategy:
 
     def run(self, poll_interval=60):
         print("[Strategy] RUN LOOP STARTED")
+        
+        # Initialize signal log file by logging strategy start
+        # This ensures the CSV file is created for all strategies, even if they fail early
+        self.log_signal("STRATEGY_STARTED", None)
 
         while self.manager.keep_running:
             # Check if paused - if so, just wait and check again
@@ -1581,14 +1623,19 @@ class Strategy:
             time_mod.sleep(poll_interval)
 
     def log_signal(self, action, combined):
-        """Save each signal to a daily CSV file."""
+        """Save each signal to a CSV file identified by account, symbol, and offset in a date folder."""
 
         # Create signals folder if missing
         Path("signals").mkdir(exist_ok=True)
 
-        # Use date-based filename
+        # Use date-based folder
         date_str = datetime.now(self.tz).strftime("%Y-%m-%d")
-        file_path = f"signals/{date_str}_signals.csv"
+        date_folder = Path("signals") / date_str
+        date_folder.mkdir(exist_ok=True)
+
+        # Create filename with account, symbol, and offset
+        filename = f"{self.account}_{self.symbol}_{self.strike_offset}_signals.csv"
+        file_path = date_folder / filename
 
         # Check if file exists (to write header only once)
         file_exists = os.path.isfile(file_path)
