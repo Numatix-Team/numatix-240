@@ -359,34 +359,24 @@ class Strategy:
         # Ensure numeric (very important with live feeds)
         df["combined_premium"] = pd.to_numeric(df["combined_premium"], errors="coerce")
         df["combined_volume"] = pd.to_numeric(df["combined_volume"], errors="coerce")
-        
-        # Debug: Check for NaN or invalid values
-        nan_premium = df["combined_premium"].isna().sum()
-        nan_volume = df["combined_volume"].isna().sum()
-        if nan_premium > 0 or nan_volume > 0:
-            print(f"[VWAP] WARNING: Found {nan_premium} NaN in combined_premium, {nan_volume} NaN in combined_volume")
-        
-        # Turnover = combined_premium * combined_volume
+        # Turnover
         df["turnover"] = df["combined_premium"] * df["combined_volume"]
 
-        # Total VWAP for session: sum(turnover) / sum(volume)
+        # Cumulative values
+        df["cum_turnover"] = df["turnover"].cumsum()
+        df["cum_volume"] = df["combined_volume"].cumsum()
+
+        # VWAP column (safe division)
+        df["vwap"] = df["cum_turnover"] / df["cum_volume"].replace(0, pd.NA)
+
+        # Total VWAP for session
         tot_vol = df["combined_volume"].sum()
         if tot_vol == 0:
-            print(f"[VWAP] ERROR: Total volume is zero, cannot calculate VWAP")
             return False
 
-        tot_turnover = df["turnover"].sum()
-        self.vwap = float(tot_turnover / tot_vol)
+        self.vwap = float(df["turnover"].sum() / tot_vol)
 
-        # Debug logging
-        print(f"[VWAP] Calculation:")
-        print(f"[VWAP]   Total turnover: {tot_turnover:.2f}")
-        print(f"[VWAP]   Total volume: {tot_vol:.0f}")
-        print(f"[VWAP]   VWAP = {tot_turnover:.2f} / {tot_vol:.0f} = {self.vwap:.4f}")
-        print(f"[VWAP]   Data points: {len(df)} bars")
-        if len(df) > 0:
-            print(f"[VWAP]   Combined premium range: {df['combined_premium'].min():.4f} to {df['combined_premium'].max():.4f}")
-            print(f"[VWAP]   Combined volume range: {df['combined_volume'].min():.0f} to {df['combined_volume'].max():.0f}")
+        print(f"[Strategy] VWAP={self.vwap:.2f}")
 
         # # Push back to class
         # self.hist_df = df
@@ -421,23 +411,16 @@ class Strategy:
         cp = self.broker.get_option_premium(self.symbol, self.expiry, self.call_strike, "C")
         print(f"[SIGNAL]   PUT: {self.symbol} {self.expiry} {self.put_strike}P")
         pp = self.broker.get_option_premium(self.symbol, self.expiry, self.put_strike, "P")
-        
-        # Debug: Show raw price data
-        print(f"[SIGNAL] Call premium data: bid={cp.get('bid')}, ask={cp.get('ask')}, last={cp.get('last')}, mid={cp.get('mid')}")
-        print(f"[SIGNAL] Put premium data: bid={pp.get('bid')}, ask={pp.get('ask')}, last={pp.get('last')}, mid={pp.get('mid')}")
-        
         c_price = self._extract_price(cp)
         p_price = self._extract_price(pp)
-        
-        print(f"[SIGNAL] Extracted prices: call={c_price}, put={p_price}")
+        print(c_price,p_price)
 
         if c_price is None or p_price is None:
-            print(f"[SIGNAL] ERROR: Missing price data (call={c_price}, put={p_price})")
             self.log_signal("NONE", None)
             return {"action": "NONE"}
 
         combined = c_price + p_price
-        print(f"[SIGNAL] Combined premium: {combined:.4f} (call {c_price:.4f} + put {p_price:.4f})")
+        print(combined)
 
         if any([
             self._spread(cp) is None,
@@ -451,24 +434,12 @@ class Strategy:
 
         threshold = self.vwap * self.entry_vwap_mult
 
-        # Debug logging for entry condition
-        print(f"[SIGNAL] Entry condition check:")
-        print(f"[SIGNAL]   Combined premium: {combined:.4f}")
-        print(f"[SIGNAL]   VWAP: {self.vwap:.4f}")
-        print(f"[SIGNAL]   Threshold (VWAP * {self.entry_vwap_mult}): {threshold:.4f}")
-        print(f"[SIGNAL]   Condition: combined > vwap? {combined > self.vwap}")
-        print(f"[SIGNAL]   Position open: {self.position_open}")
-
-        # Enter when combined premium is ABOVE VWAP (for selling straddle, we want high premiums)
-        if not self.position_open and combined > self.vwap:
+        if not self.position_open and combined < threshold:
             # Log signal when SELL_STRADDLE is triggered
             self.log_signal("SELL_STRADDLE", combined)
-            print(f"[SIGNAL] ✓ ENTRY TRIGGERED: combined ({combined:.4f}) > vwap ({self.vwap:.4f})")
             return {"action": "SELL_STRADDLE", "combined": combined}
 
         # Log signal when no action is taken
-        if not self.position_open:
-            print(f"[SIGNAL] ✗ NO ENTRY: combined ({combined:.4f}) <= vwap ({self.vwap:.4f})")
         self.log_signal("NONE", combined)
         return {"action": "NONE"}
 
