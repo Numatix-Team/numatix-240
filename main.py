@@ -144,9 +144,11 @@ class Strategy:
 
         self.init_call_qty = self.call_qty
         self.init_put_qty  = self.put_qty
+        self.init_hedge_qty = self.hedge_qty if self.enable_hedges else 0
 
         self.curr_call_qty = self.call_qty
-        self.curr_put_qty  = self.put_qty   
+        self.curr_put_qty  = self.put_qty
+        self.curr_hedge_qty = self.hedge_qty if self.enable_hedges else 0   
 
     # RESTORE ACTIVE POSITIONS
     def _load_active_ids(self):
@@ -229,7 +231,35 @@ class Strategy:
                 "otm_call_id": self.otm_call_id,
                 "otm_put_id": self.otm_put_id
             }
+            
+            # Restore quantities from database positions
+            if self.atm_call_id:
+                call_pos = get_position_by_id(self.atm_call_id, self.account, self.symbol)
+                if call_pos:
+                    self.curr_call_qty = call_pos.get("qty", 0)
+                    self.init_call_qty = self.curr_call_qty  # Use current as initial if restoring
+            
+            if self.atm_put_id:
+                put_pos = get_position_by_id(self.atm_put_id, self.account, self.symbol)
+                if put_pos:
+                    self.curr_put_qty = put_pos.get("qty", 0)
+                    self.init_put_qty = self.curr_put_qty  # Use current as initial if restoring
+            
+            if self.enable_hedges:
+                if self.otm_call_id:
+                    hedge_call_pos = get_position_by_id(self.otm_call_id, self.account, self.symbol)
+                    if hedge_call_pos:
+                        self.curr_hedge_qty = hedge_call_pos.get("qty", 0)
+                        self.init_hedge_qty = self.curr_hedge_qty  # Use current as initial if restoring
+                elif self.otm_put_id:
+                    # If only one hedge exists, use its quantity
+                    hedge_put_pos = get_position_by_id(self.otm_put_id, self.account, self.symbol)
+                    if hedge_put_pos:
+                        self.curr_hedge_qty = hedge_put_pos.get("qty", 0)
+                        self.init_hedge_qty = self.curr_hedge_qty
+            
             print(f"[LOAD] Active positions loaded: ATM_C={atm_call_id}, ATM_P={atm_put_id}, OTM_C={otm_call_id}, OTM_P={otm_put_id}")
+            print(f"[LOAD] Restored quantities: Call={self.curr_call_qty}, Put={self.curr_put_qty}, Hedge={self.curr_hedge_qty if self.enable_hedges else 0}")
         else:
             print(f"[LOAD] No matching active positions found for strikes: Call={self.call_strike}, Put={self.put_strike}")
             self.position = None
@@ -501,9 +531,11 @@ class Strategy:
 
             self.init_call_qty = self.call_qty
             self.init_put_qty  = self.put_qty
+            self.init_hedge_qty = self.hedge_qty if self.enable_hedges else 0
 
             self.curr_call_qty = self.call_qty
             self.curr_put_qty  = self.put_qty
+            self.curr_hedge_qty = self.hedge_qty if self.enable_hedges else 0
             
         except Exception as e:
             print(f"[EXECUTE] Error during trade execution: {e} - closing any filled legs")
@@ -546,6 +578,9 @@ class Strategy:
         self.otm_call_id = None
         self.otm_put_id = None
         self.position_open = False
+        self.curr_call_qty = 0
+        self.curr_put_qty = 0
+        self.curr_hedge_qty = 0
         
         for tp in self.tp_levels:
             tp["done"] = False
@@ -553,11 +588,14 @@ class Strategy:
     # LIVE UPDATES
     def _update_live_leg(self, pos_id, test_mode=False):
         pos = get_position_by_id(pos_id, self.account, self.symbol)
-        if pos is None or not pos.get("active", False):
-            if pos is None:
-                print(f"[UPDATE] Position {pos_id} not found in database")
-            else:
-                print(f"[UPDATE] Position {pos_id} is not active, skipping update")
+        if pos is None:
+            print(f"[UPDATE] Position {pos_id} not found in database")
+            return
+        
+        # Skip update if quantity is 0 (position is closed)
+        qty = pos.get("qty", 0)
+        if qty <= 0:
+            print(f"[UPDATE] Position {pos_id} has quantity 0, skipping update")
             return
 
         pos_type = pos.get("position_type", "UNKNOWN")
@@ -656,6 +694,13 @@ class Strategy:
         pos["unrealized_pnl"] = unrealized_pnl
         pos["realized_pnl"] = existing_realized_pnl  # Keep existing realized PnL from partial exits
         pos["last_update"] = datetime.now(self.tz).isoformat()
+        
+        # Update active flag based on quantity (always True here since we skip if qty <= 0)
+        pos["active"] = True
+        
+        # Clear exit_time if it was set (position is active)
+        if pos.get("exit_time"):
+            pos["exit_time"] = None
 
         # Safe formatting for None values
         bid_str = f"${bid:.2f}" if bid is not None else "N/A"
@@ -677,6 +722,8 @@ class Strategy:
         # Get actual available quantities from database positions
         call_available_qty = 0
         put_available_qty = 0
+        hedge_call_available_qty = 0
+        hedge_put_available_qty = 0
         
         if self.atm_call_id:
             call_pos = get_position_by_id(self.atm_call_id, self.account, self.symbol)
@@ -687,14 +734,30 @@ class Strategy:
             put_pos = get_position_by_id(self.atm_put_id, self.account, self.symbol)
             if put_pos:
                 put_available_qty = put_pos.get("qty", 0)
+        
+        if self.enable_hedges:
+            if self.otm_call_id:
+                hedge_call_pos = get_position_by_id(self.otm_call_id, self.account, self.symbol)
+                if hedge_call_pos:
+                    hedge_call_available_qty = hedge_call_pos.get("qty", 0)
+            
+            if self.otm_put_id:
+                hedge_put_pos = get_position_by_id(self.otm_put_id, self.account, self.symbol)
+                if hedge_put_pos:
+                    hedge_put_available_qty = hedge_put_pos.get("qty", 0)
 
         # Calculate exit qty from ORIGINAL qty
         call_exit_qty = int(math.ceil(self.init_call_qty * exit_fraction))
         put_exit_qty  = int(math.ceil(self.init_put_qty * exit_fraction))
+        hedge_call_exit_qty = int(math.ceil(self.init_hedge_qty * exit_fraction)) if self.enable_hedges else 0
+        hedge_put_exit_qty  = int(math.ceil(self.init_hedge_qty * exit_fraction)) if self.enable_hedges else 0
 
         # Cap by remaining qty (use both in-memory and database quantities for safety)
         call_exit_qty = min(call_exit_qty, self.curr_call_qty, call_available_qty)
         put_exit_qty  = min(put_exit_qty, self.curr_put_qty, put_available_qty)
+        if self.enable_hedges:
+            hedge_call_exit_qty = min(hedge_call_exit_qty, self.curr_hedge_qty, hedge_call_available_qty)
+            hedge_put_exit_qty  = min(hedge_put_exit_qty, self.curr_hedge_qty, hedge_put_available_qty)
 
         if call_exit_qty <= 0 or put_exit_qty <= 0:
             print("[TP] Nothing left to exit")
@@ -708,6 +771,15 @@ class Strategy:
         if put_exit_qty > put_available_qty:
             print(f"[TP] WARNING: Put exit qty ({put_exit_qty}) exceeds available qty ({put_available_qty}). Capping to available.")
             put_exit_qty = put_available_qty
+        
+        if self.enable_hedges:
+            if hedge_call_exit_qty > hedge_call_available_qty:
+                print(f"[TP] WARNING: Hedge Call exit qty ({hedge_call_exit_qty}) exceeds available qty ({hedge_call_available_qty}). Capping to available.")
+                hedge_call_exit_qty = hedge_call_available_qty
+            
+            if hedge_put_exit_qty > hedge_put_available_qty:
+                print(f"[TP] WARNING: Hedge Put exit qty ({hedge_put_exit_qty}) exceeds available qty ({hedge_put_available_qty}). Capping to available.")
+                hedge_put_exit_qty = hedge_put_available_qty
         
         if call_exit_qty <= 0 or put_exit_qty <= 0:
             print("[TP] Nothing left to exit after validation")
@@ -725,9 +797,27 @@ class Strategy:
             "P", put_exit_qty, "BUY", self.exchange, True
         )
 
+        # ---- HEDGE CALL (if enabled) ----
+        hedge_call_resp = None
+        if self.enable_hedges and hedge_call_exit_qty > 0:
+            hedge_call_resp = self.broker.place_option_market_order(
+                self.symbol, self.expiry, self.hedge_call_strike,
+                "C", hedge_call_exit_qty, "SELL", self.exchange, True
+            )
+
+        # ---- HEDGE PUT (if enabled) ----
+        hedge_put_resp = None
+        if self.enable_hedges and hedge_put_exit_qty > 0:
+            hedge_put_resp = self.broker.place_option_market_order(
+                self.symbol, self.expiry, self.hedge_put_strike,
+                "P", hedge_put_exit_qty, "SELL", self.exchange, True
+            )
+
         # Update CURRENT quantities
         self.curr_call_qty -= call_exit_qty
         self.curr_put_qty  -= put_exit_qty
+        if self.enable_hedges:
+            self.curr_hedge_qty -= hedge_call_exit_qty  # Both hedges use same qty
 
         # Update database positions with new quantities and realized PnL
         if self.atm_call_id:
@@ -752,12 +842,18 @@ class Strategy:
                 call_pos["qty"] = self.curr_call_qty
                 call_pos["last_update"] = datetime.now(self.tz).isoformat()
                 
-                # Check if position should be marked as closed (quantity reached 0)
+                # Update active flag based on quantity (always set it, don't just check for <= 0)
+                call_pos["active"] = (self.curr_call_qty > 0)
+                
                 if self.curr_call_qty <= 0:
-                    call_pos["active"] = False
                     call_pos["exit_time"] = datetime.now(self.tz).isoformat()
                     call_pos["unrealized_pnl"] = 0.0
                     print(f"[TP] CALL position fully closed (qty=0), marking as inactive")
+                else:
+                    # Clear exit_time if position is still active
+                    if call_pos.get("exit_time"):
+                        call_pos["exit_time"] = None
+                    print(f"[TP] CALL position still active (qty={self.curr_call_qty})")
                 
                 # Recalculate unrealized PnL immediately with new quantity
                 # Get current market price for recalculation
@@ -814,12 +910,18 @@ class Strategy:
                 put_pos["qty"] = self.curr_put_qty
                 put_pos["last_update"] = datetime.now(self.tz).isoformat()
                 
-                # Check if position should be marked as closed (quantity reached 0)
+                # Update active flag based on quantity (always set it, don't just check for <= 0)
+                put_pos["active"] = (self.curr_put_qty > 0)
+                
                 if self.curr_put_qty <= 0:
-                    put_pos["active"] = False
                     put_pos["exit_time"] = datetime.now(self.tz).isoformat()
                     put_pos["unrealized_pnl"] = 0.0
                     print(f"[TP] PUT position fully closed (qty=0), marking as inactive")
+                else:
+                    # Clear exit_time if position is still active
+                    if put_pos.get("exit_time"):
+                        put_pos["exit_time"] = None
+                    print(f"[TP] PUT position still active (qty={self.curr_put_qty})")
                 
                 # Recalculate unrealized PnL immediately with new quantity
                 # Get current market price for recalculation
@@ -854,16 +956,155 @@ class Strategy:
                 update_position_in_db(put_pos)
                 print(f"[TP] PUT position updated in database")
 
+        # Update hedge positions with new quantities and realized PnL
+        if self.enable_hedges:
+            if self.otm_call_id and hedge_call_exit_qty > 0:
+                hedge_call_pos = get_position_by_id(self.otm_call_id, self.account, self.symbol)
+                if hedge_call_pos:
+                    entry = hedge_call_pos.get("entry_price")
+                    exit_price = hedge_call_resp.get("fill_price") if hedge_call_resp else None
+                    old_qty = hedge_call_pos.get("qty", 0)
+                    old_realized = hedge_call_pos.get("realized_pnl", 0) or 0
+                    
+                    print(f"[TP] HEDGE CALL Position Update:")
+                    print(f"[TP]   Old Qty: {old_qty}, Exit Qty: {hedge_call_exit_qty}, New Qty: {self.curr_hedge_qty}")
+                    print(f"[TP]   Entry Price: ${entry:.2f}, Exit Price: ${exit_price:.2f}")
+                    
+                    if entry is not None and exit_price is not None:
+                        # Calculate realized PnL for partial exit (BUY side)
+                        partial_realized_pnl = (exit_price - entry) * hedge_call_exit_qty
+                        new_realized = old_realized + partial_realized_pnl
+                        hedge_call_pos["realized_pnl"] = new_realized
+                        print(f"[TP]   Realized PnL: ${old_realized:.2f} + ${partial_realized_pnl:.2f} = ${new_realized:.2f}")
+                    
+                    hedge_call_pos["qty"] = self.curr_hedge_qty
+                    hedge_call_pos["last_update"] = datetime.now(self.tz).isoformat()
+                    
+                    # Update active flag based on quantity (always set it, don't just check for <= 0)
+                    hedge_call_pos["active"] = (self.curr_hedge_qty > 0)
+                    
+                    if self.curr_hedge_qty <= 0:
+                        hedge_call_pos["exit_time"] = datetime.now(self.tz).isoformat()
+                        hedge_call_pos["unrealized_pnl"] = 0.0
+                        print(f"[TP] HEDGE CALL position fully closed (qty=0), marking as inactive")
+                    else:
+                        # Clear exit_time if position is still active
+                        if hedge_call_pos.get("exit_time"):
+                            hedge_call_pos["exit_time"] = None
+                        print(f"[TP] HEDGE CALL position still active (qty={self.curr_hedge_qty})")
+                    
+                    # Recalculate unrealized PnL immediately with new quantity
+                    if self.curr_hedge_qty > 0:
+                        print(f"[TP]   Fetching current bid/ask prices for remaining HEDGE CALL position...")
+                        data = self.broker.get_option_premium(
+                            hedge_call_pos["symbol"], hedge_call_pos["expiry"], hedge_call_pos["strike"], hedge_call_pos["right"], test_mode=False
+                        )
+                        if data:
+                            bid = data.get("bid")
+                            ask = data.get("ask")
+                            last = data.get("last")
+                            
+                            # Use ASK for BUY positions (hedge_call_pos is BUY side)
+                            last_price = ask
+                            
+                            if last_price is not None:
+                                # Recalculate unrealized PnL with remaining quantity (BUY side)
+                                old_unrealized = hedge_call_pos.get("unrealized_pnl", 0) or 0
+                                hedge_call_pos["unrealized_pnl"] = (last_price - entry) * self.curr_hedge_qty
+                                hedge_call_pos["last_price"] = last
+                                hedge_call_pos["bid"] = bid
+                                hedge_call_pos["ask"] = ask
+                                last_str = f"${last:.2f}" if last is not None else "N/A"
+                                print(f"[TP]   Unrealized PnL: ${old_unrealized:.2f} → ${hedge_call_pos['unrealized_pnl']:.2f} (based on new qty {self.curr_hedge_qty})")
+                                print(f"[TP]   Using Price: ${last_price:.2f} (ask) for PnL, Storing Last: {last_str} in DB")
+                            else:
+                                print(f"[TP] Could not get current price for unrealized PnL recalculation")
+                        else:
+                            print(f"[TP] No market data returned for unrealized PnL recalculation")
+                    print(f"[TP] Updating HEDGE CALL position in database...")
+                    update_position_in_db(hedge_call_pos)
+                    print(f"[TP] HEDGE CALL position updated in database")
+
+            if self.otm_put_id and hedge_put_exit_qty > 0:
+                hedge_put_pos = get_position_by_id(self.otm_put_id, self.account, self.symbol)
+                if hedge_put_pos:
+                    entry = hedge_put_pos.get("entry_price")
+                    exit_price = hedge_put_resp.get("fill_price") if hedge_put_resp else None
+                    old_qty = hedge_put_pos.get("qty", 0)
+                    old_realized = hedge_put_pos.get("realized_pnl", 0) or 0
+                    
+                    print(f"[TP] HEDGE PUT Position Update:")
+                    print(f"[TP]   Old Qty: {old_qty}, Exit Qty: {hedge_put_exit_qty}, New Qty: {self.curr_hedge_qty}")
+                    print(f"[TP]   Entry Price: ${entry:.2f}, Exit Price: ${exit_price:.2f}")
+                    
+                    if entry is not None and exit_price is not None:
+                        # Calculate realized PnL for partial exit (BUY side)
+                        partial_realized_pnl = (exit_price - entry) * hedge_put_exit_qty
+                        new_realized = old_realized + partial_realized_pnl
+                        hedge_put_pos["realized_pnl"] = new_realized
+                        print(f"[TP]   Realized PnL: ${old_realized:.2f} + ${partial_realized_pnl:.2f} = ${new_realized:.2f}")
+                    
+                    hedge_put_pos["qty"] = self.curr_hedge_qty
+                    hedge_put_pos["last_update"] = datetime.now(self.tz).isoformat()
+                    
+                    # Update active flag based on quantity (always set it, don't just check for <= 0)
+                    hedge_put_pos["active"] = (self.curr_hedge_qty > 0)
+                    
+                    if self.curr_hedge_qty <= 0:
+                        hedge_put_pos["exit_time"] = datetime.now(self.tz).isoformat()
+                        hedge_put_pos["unrealized_pnl"] = 0.0
+                        print(f"[TP] HEDGE PUT position fully closed (qty=0), marking as inactive")
+                    else:
+                        # Clear exit_time if position is still active
+                        if hedge_put_pos.get("exit_time"):
+                            hedge_put_pos["exit_time"] = None
+                        print(f"[TP] HEDGE PUT position still active (qty={self.curr_hedge_qty})")
+                    
+                    # Recalculate unrealized PnL immediately with new quantity
+                    if self.curr_hedge_qty > 0:
+                        print(f"[TP]   Fetching current bid/ask prices for remaining HEDGE PUT position...")
+                        data = self.broker.get_option_premium(
+                            hedge_put_pos["symbol"], hedge_put_pos["expiry"], hedge_put_pos["strike"], hedge_put_pos["right"], test_mode=False
+                        )
+                        if data:
+                            bid = data.get("bid")
+                            ask = data.get("ask")
+                            last = data.get("last")
+                            
+                            # Use ASK for BUY positions (hedge_put_pos is BUY side)
+                            last_price = ask
+                            
+                            if last_price is not None:
+                                # Recalculate unrealized PnL with remaining quantity (BUY side)
+                                old_unrealized = hedge_put_pos.get("unrealized_pnl", 0) or 0
+                                hedge_put_pos["unrealized_pnl"] = (last_price - entry) * self.curr_hedge_qty
+                                hedge_put_pos["last_price"] = last
+                                hedge_put_pos["bid"] = bid
+                                hedge_put_pos["ask"] = ask
+                                last_str = f"${last:.2f}" if last is not None else "N/A"
+                                print(f"[TP]   Unrealized PnL: ${old_unrealized:.2f} → ${hedge_put_pos['unrealized_pnl']:.2f} (based on new qty {self.curr_hedge_qty})")
+                                print(f"[TP]   Using Price: ${last_price:.2f} (ask) for PnL, Storing Last: {last_str} in DB")
+                            else:
+                                print(f"[TP] Could not get current price for unrealized PnL recalculation")
+                        else:
+                            print(f"[TP] No market data returned for unrealized PnL recalculation")
+                    print(f"[TP] Updating HEDGE PUT position in database...")
+                    update_position_in_db(hedge_put_pos)
+                    print(f"[TP] HEDGE PUT position updated in database")
+
         print(
             f"[TP] Remaining qty → CALL {self.curr_call_qty}, "
             f"PUT {self.curr_put_qty}"
         )
+        if self.enable_hedges:
+            print(f"[TP] Remaining hedge qty → {self.curr_hedge_qty}")
         
         # Check if both positions are fully closed and mark position as closed
         if self.curr_call_qty <= 0 and self.curr_put_qty <= 0:
             print("[TP] All quantities exited via partial close - marking position as closed")
             self.position_open = False
-            save_active_ids(False, None, None, None, None, self.account, self.symbol)
+            # Update only THIS strategy's positions (not all positions in database)
+            save_active_ids(False, self.atm_call_id, self.atm_put_id, self.otm_call_id, self.otm_put_id, self.account, self.symbol)
 
 
     # POSITION MANAGEMENT
@@ -1002,7 +1243,12 @@ class Strategy:
             if self.curr_call_qty <= 0 and self.curr_put_qty <= 0:
                 print("[MANAGE] All quantities exited via TP")
                 self.position_open = False
-                save_active_ids(False, None, None, None, None, self.account, self.symbol)
+                # Update only THIS strategy's positions (not all positions in database)
+                save_active_ids(False, self.atm_call_id, self.atm_put_id, self.otm_call_id, self.otm_put_id, self.account, self.symbol)
+                # Reset TP levels since all positions are closed
+                for tp in self.tp_levels:
+                    tp["done"] = False
+                print("[MANAGE] TP levels reset - all positions closed")
                 return {"exit_reason": "ALL TP COMPLETED"}
 
             # --------------------
@@ -1047,31 +1293,44 @@ class Strategy:
 
         if self.enable_hedges:
 
-            if self.otm_call_id:
+            if self.otm_call_id and self.curr_hedge_qty > 0:
                 resp = self.broker.place_option_market_order(
-                    self.symbol, self.expiry, self.hedge_call_strike, "C", self.hedge_qty, "SELL", self.exchange, True
+                    self.symbol, self.expiry, self.hedge_call_strike, "C", self.curr_hedge_qty, "SELL", self.exchange, True
                 )
                 self._close_leg(self.otm_call_id, resp)
 
-            if self.otm_put_id:
+            if self.otm_put_id and self.curr_hedge_qty > 0:
                 resp = self.broker.place_option_market_order(
-                    self.symbol, self.expiry, self.hedge_put_strike, "P", self.hedge_qty, "SELL", self.exchange, True
+                    self.symbol, self.expiry, self.hedge_put_strike, "P", self.curr_hedge_qty, "SELL", self.exchange, True
                 )
                 self._close_leg(self.otm_put_id, resp)
 
         self.init_call_qty = 0
         self.init_put_qty = 0
+        self.init_hedge_qty = 0
         self.curr_call_qty = 0
         self.curr_put_qty = 0
+        self.curr_hedge_qty = 0
 
-
-        save_active_ids(False, None, None, None, None, self.account, self.symbol)
+        # Update only THIS strategy's positions (not all positions in database)
+        # Save the IDs before clearing them
+        atm_call = self.atm_call_id
+        atm_put = self.atm_put_id
+        otm_call = self.otm_call_id
+        otm_put = self.otm_put_id
+        save_active_ids(False, atm_call, atm_put, otm_call, otm_put, self.account, self.symbol)
 
         self.atm_call_id = None
         self.atm_put_id = None
         self.otm_call_id = None
         self.otm_put_id = None
         self.position_open = False
+
+        # Reset TP levels if stop loss is triggered
+        if reason == "STOP LOSS":
+            for tp in self.tp_levels:
+                tp["done"] = False
+            print("[EXIT] TP levels reset - stop loss triggered")
 
         return {"exit_reason": reason}
 

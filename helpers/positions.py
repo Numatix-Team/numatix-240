@@ -177,28 +177,37 @@ def load_active_ids(account=None, symbol=None):
 
 
 def save_active_ids(position_open, atm_call_id, atm_put_id, otm_call_id, otm_put_id, account=None, symbol=None):
-    """Save active position IDs by updating active field in database."""
+    """Save active position IDs by updating active field in database based on quantity.
+    
+    IMPORTANT: Only updates the specific position IDs passed in. Does NOT touch other positions.
+    This is critical for multi-threaded scenarios where multiple strategies run simultaneously.
+    """
     if not account or not symbol:
         raise ValueError("account and symbol are required for save_active_ids")
     
     db = get_db(account, symbol)
     
-    # Set all positions to inactive if position_open is False
-    if not position_open:
-        active_positions = db.get_active_positions(account=None, symbol=None)
-        for pos in active_positions:
-            db.update_position(pos["id"], {"active": 0})
-        return
+    # Update active status for specific positions based on their quantity
+    # Active should be True if qty > 0, False if qty <= 0
+    # We only update the positions that are passed in, never touch other positions
+    def update_active_if_needed(pos_id):
+        if pos_id:
+            pos = get_position_by_id(pos_id, account, symbol)
+            if pos:
+                qty = pos.get("qty", 0)
+                should_be_active = (qty > 0)
+                current_active = pos.get("active", False)
+                # Only update if it's incorrect
+                if current_active != should_be_active:
+                    db.update_position(pos_id, {"active": 1 if should_be_active else 0})
+                    print(f"[SAVE_ACTIVE] Updated {pos_id[:20]}... active={should_be_active} (qty={qty})")
     
-    # Update active status for specific positions
-    if atm_call_id:
-        db.update_position(atm_call_id, {"active": 1})
-    if atm_put_id:
-        db.update_position(atm_put_id, {"active": 1})
-    if otm_call_id:
-        db.update_position(otm_call_id, {"active": 1})
-    if otm_put_id:
-        db.update_position(otm_put_id, {"active": 1})
+    # Always update based on quantity, regardless of position_open flag
+    # If position_open is False, we still check each position's quantity
+    update_active_if_needed(atm_call_id)
+    update_active_if_needed(atm_put_id)
+    update_active_if_needed(otm_call_id)
+    update_active_if_needed(otm_put_id)
 
 def update_position_in_db(updated_pos):
     """Update position in database."""

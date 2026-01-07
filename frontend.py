@@ -426,16 +426,8 @@ def positions_page():
         
         positions.append(p)
     
-    active_positions = [p for p in positions if p.get("active", False)]
-    
-    # Build active IDs from filtered active positions (today only)
-    active_ids = {
-        "position_open": len(active_positions) > 0,
-        "atm_call_id": next((p["id"] for p in active_positions if p.get("position_type") == "ATM" and p.get("right") == "C"), None),
-        "atm_put_id": next((p["id"] for p in active_positions if p.get("position_type") == "ATM" and p.get("right") == "P"), None),
-        "otm_call_id": next((p["id"] for p in active_positions if p.get("position_type") == "OTM" and p.get("right") == "C"), None),
-        "otm_put_id": next((p["id"] for p in active_positions if p.get("position_type") == "OTM" and p.get("right") == "P"), None),
-    }
+    # Removed active positions tracking since we're running multiple threads with different strikes
+    # Each thread manages its own positions independently
 
     # ------------------------------------
     # Compute PnL from database fields (today only)
@@ -493,28 +485,6 @@ def positions_page():
 
 
 
-
-    st.markdown("---")
-
-    # ------------------------------------
-    # ACTIVE POSITIONS
-    # ------------------------------------
-    st.subheader("Active Positions")
-
-    if not active_ids["position_open"]:
-        st.info("No active positions.")
-    else:
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.write("### ATM Positions")
-            st.write(f"**ATM Call ID:** {active_ids.get('atm_call_id')}")
-            st.write(f"**ATM Put ID:** {active_ids.get('atm_put_id')}")
-
-        with col2:
-            st.write("### OTM Positions")
-            st.write(f"**OTM Call ID:** {active_ids.get('otm_call_id')}")
-            st.write(f"**OTM Put ID:** {active_ids.get('otm_put_id')}")
 
     st.markdown("---")
 
