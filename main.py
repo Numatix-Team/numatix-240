@@ -48,15 +48,19 @@ def parse_args():
     parser.add_argument(
         "--range",
         type=str,
+        nargs="?",
         default=None,
-        help="Strike range as 'start:end' (e.g., '-2:2' for offsets -2 to 2)"
+        metavar="START:END",
+        help="Strike range as 'start:end' or 'start-end'; start/end can be negative (e.g. '-2:3')"
     )
 
     parser.add_argument(
         "--exclude",
         type=str,
+        nargs="?",
         default="",
-        help="Offsets to exclude from range (e.g. 5,7 or 5;7 or 5 7)"
+        metavar="LIST",
+        help="Offsets to exclude from range (can be negative); e.g. -1,5,7 or -1;5;7"
     )
 
     parser.add_argument(
@@ -2045,19 +2049,37 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[Main] Warning: Could not write tracking files: {e}")
 
-    # Parse strike range if provided
+    # Parse strike range if provided (start/end can be negative, e.g. -2:3)
+    # Support both ':' and '-' as separator (Windows may drop ':' in some launch scenarios)
     strike_range = [0]  # Default
-    if args.range:
+    if args.range and args.range.strip():
         try:
-            start, end = map(int, args.range.split(":"))
+            range_str = args.range.strip()
+            if ":" in range_str:
+                start, end = map(int, range_str.split(":", 1))
+            elif "-" in range_str:
+                # Support "4-10" or "-2-3" (negative start)
+                parts = range_str.split("-", 2)
+                if len(parts) == 2 and parts[0].strip() != "":
+                    start, end = int(parts[0].strip()), int(parts[1].strip())
+                elif len(parts) == 3 and parts[0].strip() == "":
+                    start, end = -int(parts[1].strip()), int(parts[2].strip())
+                else:
+                    raise ValueError(f"Range format unclear: {range_str!r}")
+            else:
+                raise ValueError(f"Range must contain ':' or '-'")
             strike_range = list(range(start, end + 1))
-            # Parse exclude list (comma, semicolon, or space separated)
+            # Parse exclude list (comma, semicolon, or space separated; values can be negative)
             exclude_set = set()
-            if args.exclude and args.exclude.strip():
-                for part in args.exclude.replace(";", ",").split(","):
+            exclude_str = (args.exclude or "").strip()
+            if exclude_str:
+                for part in exclude_str.replace(";", ",").split(","):
                     for num in part.split():
+                        token = num.strip()
+                        if not token:
+                            continue
                         try:
-                            exclude_set.add(int(num.strip()))
+                            exclude_set.add(int(token))
                         except ValueError:
                             pass
                 if exclude_set:

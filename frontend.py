@@ -913,15 +913,18 @@ def main():
     exclude_offsets = st.text_input(
         "Exclude offsets (optional)",
         value="",
-        placeholder="e.g. 5, 7 or 5;7 or 5 7",
-        help="Numbers to exclude from the range above. Use comma, semicolon, or space as separator."
+        placeholder="e.g. -1, 5, 7 or -1;5;7",
+        help="Offsets to exclude from the range above (can be negative). Use comma, semicolon, or space as separator."
     )
     
     if range_start > range_end:
         st.error("Range start must be less than or equal to range end")
         strike_range_str = None
+        strike_range_arg = None
     else:
         strike_range_str = f"{range_start}:{range_end}"
+        # Use hyphen for --range so Windows doesn't drop the value (colon can be parsed as drive)
+        strike_range_arg = f"{range_start}-{range_end}"
 
     st.markdown("---")
 
@@ -929,7 +932,7 @@ def main():
 
     # ---------------- START ---------------- 
     if st.button("Start Strategy", type="primary"):
-        if strike_range_str is None:
+        if strike_range_str is None or strike_range_arg is None:
             st.error("Please fix the range configuration before starting")
         else:
             base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -945,10 +948,10 @@ def main():
                     set_account_paused(account, False, symbol)
                     set_account_stopped(account, False, symbol)
                     
-                    # Build command: account, symbol, range, and optional exclude
-                    cmd_args = [python_path, main_path, '--account', account, '--symbol', symbol, '--range', strike_range_str]
+                    # Build command: use --key=value so negative ranges (e.g. -4-10) aren't parsed as separate options
+                    cmd_args = [python_path, main_path, '--account', account, '--symbol', symbol, f'--range={strike_range_arg}']
                     if exclude_offsets and exclude_offsets.strip():
-                        cmd_args.extend(['--exclude', exclude_offsets.strip()])
+                        cmd_args.append(f'--exclude={exclude_offsets.strip()}')
                     
                     if os.name == 'nt':  # Windows
                         # Use CREATE_NEW_CONSOLE to open in new window

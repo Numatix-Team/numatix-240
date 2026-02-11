@@ -5,7 +5,7 @@
   },
   "acc1_SPX": {
     "paused": false,
-    "stopped": false
+    "stopped": true
   },
   "acc1_XSP": {
     "paused": false,
