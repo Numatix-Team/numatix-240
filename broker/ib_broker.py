@@ -24,6 +24,9 @@ class IBBroker(EWrapper, EClient):
         self.lock = threading.Lock()
         self.connected = False
         self.next_valid_id = None
+        self.api_thread = None
+        self._conn_lock = threading.Lock()
+        self._host = self._port = self._client_id = None
         # Set minimum API version to support fractional shares (version 163+)
         self.minVersion = 163
         
@@ -62,15 +65,48 @@ class IBBroker(EWrapper, EClient):
         return c
 
     def connect_to_ibkr(self, host="127.0.0.1", port=7497, client_id=1):
-        """Connect to IBKR"""
+        """Connect to IBKR and start the message loop thread."""
+        self._host, self._port, self._client_id = host, port, client_id
         self.connect(host, port, client_id)
-        
-        # Start API thread
-        api_thread = threading.Thread(target=self.run, daemon=True)
-        api_thread.start()
+        self.api_thread = threading.Thread(target=self.run, daemon=True)
+        self.api_thread.start()
         time.sleep(1)
         self.connected = True
         print("Connected to IBKR")
+
+    def disconnect_from_ibkr(self):
+        """Disconnect from IBKR. Safe to call if already disconnected."""
+        with self._conn_lock:
+            self.connected = False
+            try:
+                self.disconnect()
+            except Exception as e:
+                print(f"[IBBroker] disconnect warning: {e}")
+            self.api_thread = None
+
+    def reconnect(self, host=None, port=None, client_id=None):
+        """Disconnect (if needed) and connect again. Uses stored host/port/client_id if not given."""
+        host = host or self._host or "127.0.0.1"
+        port = port or self._port or 7497
+        client_id = client_id or self._client_id or 1
+        with self._conn_lock:
+            self.connected = False
+            try:
+                self.disconnect()
+            except Exception:
+                pass
+            self.api_thread = None
+            time.sleep(1)
+        self.connect_to_ibkr(host, port, client_id)
+
+    def is_connection_alive(self):
+        """True if we believe the connection is up (thread running and connected flag)."""
+        if self.api_thread is None:
+            return False
+        if not self.api_thread.is_alive():
+            self.connected = False
+            return False
+        return self.connected
 
     # def tickPrice(self, reqId, tickType, price, attrib):
     #     with self.lock:
@@ -157,12 +193,15 @@ class IBBroker(EWrapper, EClient):
             self.next_valid_id = orderId
             print(f"Next valid order ID from IBKR: {orderId}")
 
+    # Error codes that indicate connection loss (trigger reconnect logic)
+    CONNECTION_LOST_CODES = {502, 503, 504, 1100, 1102}  # Couldn't connect, Not connected, Connectivity lost/temporary
+
     def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=""):
-        """Error callback - filter out common non-critical messages"""
+        """Error callback - filter out common non-critical messages; mark connection lost on disconnect codes."""
         # Filter out common connection status messages that are not actual errors
         ignore_codes = {
             2104,  # Market data farm connection is OK
-            2106,  # HMDS data farm connection is OK  
+            2106,  # HMDS data farm connection is OK
             2158,  # Sec-def data farm connection is OK
             2103,  # Market data farm connection is broken (temporary)
             2176,  # Fractional share warning (we handle this)
@@ -170,11 +209,14 @@ class IBBroker(EWrapper, EClient):
             2107,  # Market data farm connection is OK (alternative)
             2159,  # Sec-def data farm connection is OK (alternative)
         }
-        
+
+        if errorCode in self.CONNECTION_LOST_CODES:
+            self.connected = False
+            print(f"[IBBroker] Connection lost (code {errorCode}): {errorString}")
+
         if errorCode in ignore_codes:
-            # These are just status messages, not real errors
             return
-        
+
         # Only print actual errors
         print(f"IBKR Error {errorCode}: {errorString}")
 
