@@ -53,6 +53,13 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--exclude",
+        type=str,
+        default="",
+        help="Offsets to exclude from range (e.g. 5,7 or 5;7 or 5 7)"
+    )
+
+    parser.add_argument(
         "--test",
         action="store_true",
         help="Run in test mode (executes test function in main thread only)"
@@ -107,6 +114,7 @@ class Strategy:
         self.symbol = cfg["underlying"]["symbol"]
         self.exchange = cfg["underlying"]["exchange"]
         self.currency = cfg["underlying"]["currency"]
+        self.trading_class = cfg["underlying"].get("trading_class", "")
 
         self.expiry = cfg["expiry"]["date"]
 
@@ -406,31 +414,75 @@ class Strategy:
             # Log signal even when outside entry window
             self.log_signal("OUTSIDE_ENTRY_WINDOW", None)
             return {"action": "NONE"}
-        print(f"[SIGNAL] Fetching bid/ask prices for signal generation...")
+        print(f"[SIGNAL] Fetching OHLC data for signal generation...")
         print(f"[SIGNAL]   CALL: {self.symbol} {self.expiry} {self.call_strike}C")
-        cp = self.broker.get_option_premium(self.symbol, self.expiry, self.call_strike, "C")
+        call_ohlc = self.broker.get_option_ohlc(self.symbol, self.expiry, self.call_strike, "C")
         print(f"[SIGNAL]   PUT: {self.symbol} {self.expiry} {self.put_strike}P")
-        pp = self.broker.get_option_premium(self.symbol, self.expiry, self.put_strike, "P")
-        c_price = self._extract_price(cp)
-        p_price = self._extract_price(pp)
-        print(c_price,p_price)
+        put_ohlc = self.broker.get_option_ohlc(self.symbol, self.expiry, self.put_strike, "P")
+        
+        # Get latest data from OHLC (data is already sorted chronologically from IBKR)
+        if call_ohlc.empty or put_ohlc.empty:
+            self.log_signal("NONE", None)
+            return {"action": "NONE"}
+        
+        # Get the latest bar (most recent - last row)
+        latest_call = call_ohlc.iloc[-1]
+        latest_put = put_ohlc.iloc[-1]
+        
+        c_price = latest_call['close']
+        p_price = latest_put['close']
+        print(f"[SIGNAL] Latest call close: {c_price}, Latest put close: {p_price}")
 
-        if c_price is None or p_price is None:
+        if c_price is None or p_price is None or pd.isna(c_price) or pd.isna(p_price):
             self.log_signal("NONE", None)
             return {"action": "NONE"}
 
         combined = c_price + p_price
-        print(combined)
+        print(f"[SIGNAL] Combined premium (from OHLC): {combined}")
 
-        if any([
-            self._spread(cp) is None,
-            self._spread(pp) is None,
-            self._spread(cp) > self.max_spread,
-            self._spread(pp) > self.max_spread
-        ]):
-            # Log signal when skipped due to spread
-            self.log_signal("SKIPPED_DUE_TO_SPREAD", combined)
-            return {"action": "SKIPPED DUE TO SPREAD"}
+        # Fetch latest bid/ask to check spread
+        print(f"[SIGNAL] Fetching latest bid/ask for spread check...")
+        call_premium = self.broker.get_option_premium(self.symbol, self.expiry, self.call_strike, "C")
+        put_premium = self.broker.get_option_premium(self.symbol, self.expiry, self.put_strike, "P")
+        
+        if call_premium is None or put_premium is None:
+            print(f"[SIGNAL] Could not fetch bid/ask data for spread check")
+            self.log_signal("NONE", combined)
+            return {"action": "NONE"}
+        
+        call_bid = call_premium.get("bid")
+        call_ask = call_premium.get("ask")
+        put_bid = put_premium.get("bid")
+        put_ask = put_premium.get("ask")
+        
+        # Check if we have valid bid/ask data
+        if call_bid is None or call_ask is None or put_bid is None or put_ask is None:
+            print(f"[SIGNAL] Missing bid/ask data for spread check")
+            self.log_signal("NONE", combined)
+            return {"action": "NONE"}
+        
+        # Calculate spreads separately
+        call_spread = call_ask - call_bid
+        put_spread = put_ask - put_bid
+        
+        print(f"[SIGNAL] Call spread: {call_spread:.4f}, Put spread: {put_spread:.4f}, Max allowed: {self.max_spread:.4f}")
+        
+        # Check if either spread is too wide (check separately)
+        if call_spread > self.max_spread:
+            print(f"[SIGNAL] Call spread too wide: {call_spread:.4f} > {self.max_spread:.4f}")
+            self.log_signal("NONE", combined)
+            return {"action": "NONE"}
+        
+        if put_spread > self.max_spread:
+            print(f"[SIGNAL] Put spread too wide: {put_spread:.4f} > {self.max_spread:.4f}")
+            self.log_signal("NONE", combined)
+            return {"action": "NONE"}
+        
+        # Get latest premium from bid/ask (mid price) for logging
+        call_mid = (call_bid + call_ask) / 2
+        put_mid = (put_bid + put_ask) / 2
+        latest_combined_premium = call_mid + put_mid
+        print(f"[SIGNAL] Latest premium (bid/ask mid): {latest_combined_premium:.4f}")
 
         threshold = self.vwap * self.entry_vwap_mult
 
@@ -467,7 +519,7 @@ class Strategy:
                     self.account, self.symbol, self.expiry, self.hedge_call_strike, "C",
                     "BUY", self.hedge_qty,
                     fill_hc, hc["order_id"], "OTM", self.tz,
-                    bid=0, ask=0
+                    bid=0, ask=0, strike_offset=self.strike_offset
                 )
                 filled_legs.append((self.otm_call_id, {
                     "strike": self.hedge_call_strike, "right": "C", "qty": self.hedge_qty, "side": "BUY"
@@ -486,7 +538,7 @@ class Strategy:
                     self.account, self.symbol, self.expiry, self.hedge_put_strike, "P",
                     "BUY", self.hedge_qty,
                     fill_hp, hp["order_id"], "OTM", self.tz,
-                    bid=0, ask=0
+                    bid=0, ask=0, strike_offset=self.strike_offset
                 )
                 filled_legs.append((self.otm_put_id, {
                     "strike": self.hedge_put_strike, "right": "P", "qty": self.hedge_qty, "side": "BUY"
@@ -497,6 +549,7 @@ class Strategy:
                 self.symbol, self.expiry, self.call_strike, "C", self.call_qty, "SELL", self.exchange
             )
             fill_call = c.get("fill_price")
+            print(f"[EXECUTE] ATM Call fill price: {fill_call}")
             if fill_call is None:
                 print("[EXECUTE] ATM Call failed to fill - closing any filled legs")
                 self._close_filled_legs(filled_legs)
@@ -517,6 +570,7 @@ class Strategy:
                 self.symbol, self.expiry, self.put_strike, "P", self.put_qty, "SELL", self.exchange
             )
             fill_put = p.get("fill_price")
+            print(f"[EXECUTE] ATM Put fill price: {fill_put}")
             if fill_put is None:
                 print("[EXECUTE] ATM Put failed to fill - closing any filled legs")
                 self._close_filled_legs(filled_legs)
@@ -847,6 +901,28 @@ class Strategy:
                     new_realized = old_realized + partial_realized_pnl
                     call_pos["realized_pnl"] = new_realized
                     print(f"[TP]   Realized PnL: ${old_realized:.2f} + ${partial_realized_pnl:.2f} = ${new_realized:.2f}")
+                    
+                    # Calculate weighted average close price for multiple partial exits
+                    previous_exit_qty = self.init_call_qty - old_qty  # Total quantity exited before this exit
+                    new_exit_qty = call_exit_qty
+                    existing_close_price = call_pos.get("close_price")
+                    
+                    if existing_close_price is not None and previous_exit_qty > 0:
+                        # Weighted average: (old_avg * old_qty + new_price * new_qty) / total_exit_qty
+                        total_exit_qty = previous_exit_qty + new_exit_qty
+                        weighted_avg_close = (existing_close_price * previous_exit_qty + exit_price * new_exit_qty) / total_exit_qty
+                        call_pos["close_price"] = weighted_avg_close
+                        print(f"[TP]   Average Close Price: ${weighted_avg_close:.4f} (from ${previous_exit_qty} @ ${existing_close_price:.4f} + {new_exit_qty} @ ${exit_price:.4f})")
+                    else:
+                        # First partial exit, use current exit price
+                        call_pos["close_price"] = exit_price
+                        print(f"[TP]   Close Price: ${exit_price:.4f} (first partial exit)")
+                    
+                    # Update order_id_exit with latest order ID
+                    call_order_id = call_resp.get("order_id") if call_resp else None
+                    if call_order_id is not None:
+                        call_pos["order_id_exit"] = int(call_order_id)
+                        print(f"[TP]   Exit Order ID: {call_pos['order_id_exit']}")
                 
                 call_pos["qty"] = self.curr_call_qty
                 call_pos["last_update"] = datetime.now(self.tz).isoformat()
@@ -915,6 +991,28 @@ class Strategy:
                     new_realized = old_realized + partial_realized_pnl
                     put_pos["realized_pnl"] = new_realized
                     print(f"[TP]   Realized PnL: ${old_realized:.2f} + ${partial_realized_pnl:.2f} = ${new_realized:.2f}")
+                    
+                    # Calculate weighted average close price for multiple partial exits
+                    previous_exit_qty = self.init_put_qty - old_qty  # Total quantity exited before this exit
+                    new_exit_qty = put_exit_qty
+                    existing_close_price = put_pos.get("close_price")
+                    
+                    if existing_close_price is not None and previous_exit_qty > 0:
+                        # Weighted average: (old_avg * old_qty + new_price * new_qty) / total_exit_qty
+                        total_exit_qty = previous_exit_qty + new_exit_qty
+                        weighted_avg_close = (existing_close_price * previous_exit_qty + exit_price * new_exit_qty) / total_exit_qty
+                        put_pos["close_price"] = weighted_avg_close
+                        print(f"[TP]   Average Close Price: ${weighted_avg_close:.4f} (from ${previous_exit_qty} @ ${existing_close_price:.4f} + {new_exit_qty} @ ${exit_price:.4f})")
+                    else:
+                        # First partial exit, use current exit price
+                        put_pos["close_price"] = exit_price
+                        print(f"[TP]   Close Price: ${exit_price:.4f} (first partial exit)")
+                    
+                    # Update order_id_exit with latest order ID
+                    put_order_id = put_resp.get("order_id") if put_resp else None
+                    if put_order_id is not None:
+                        put_pos["order_id_exit"] = int(put_order_id)
+                        print(f"[TP]   Exit Order ID: {put_pos['order_id_exit']}")
                 
                 put_pos["qty"] = self.curr_put_qty
                 put_pos["last_update"] = datetime.now(self.tz).isoformat()
@@ -985,6 +1083,28 @@ class Strategy:
                         new_realized = old_realized + partial_realized_pnl
                         hedge_call_pos["realized_pnl"] = new_realized
                         print(f"[TP]   Realized PnL: ${old_realized:.2f} + ${partial_realized_pnl:.2f} = ${new_realized:.2f}")
+                        
+                        # Calculate weighted average close price for multiple partial exits
+                        previous_exit_qty = self.init_hedge_qty - old_qty  # Total quantity exited before this exit
+                        new_exit_qty = hedge_call_exit_qty
+                        existing_close_price = hedge_call_pos.get("close_price")
+                        
+                        if existing_close_price is not None and previous_exit_qty > 0:
+                            # Weighted average: (old_avg * old_qty + new_price * new_qty) / total_exit_qty
+                            total_exit_qty = previous_exit_qty + new_exit_qty
+                            weighted_avg_close = (existing_close_price * previous_exit_qty + exit_price * new_exit_qty) / total_exit_qty
+                            hedge_call_pos["close_price"] = weighted_avg_close
+                            print(f"[TP]   Average Close Price: ${weighted_avg_close:.4f} (from ${previous_exit_qty} @ ${existing_close_price:.4f} + {new_exit_qty} @ ${exit_price:.4f})")
+                        else:
+                            # First partial exit, use current exit price
+                            hedge_call_pos["close_price"] = exit_price
+                            print(f"[TP]   Close Price: ${exit_price:.4f} (first partial exit)")
+                        
+                        # Update order_id_exit with latest order ID
+                        hedge_call_order_id = hedge_call_resp.get("order_id") if hedge_call_resp else None
+                        if hedge_call_order_id is not None:
+                            hedge_call_pos["order_id_exit"] = int(hedge_call_order_id)
+                            print(f"[TP]   Exit Order ID: {hedge_call_pos['order_id_exit']}")
                     
                     hedge_call_pos["qty"] = self.curr_hedge_qty
                     hedge_call_pos["last_update"] = datetime.now(self.tz).isoformat()
@@ -1052,6 +1172,28 @@ class Strategy:
                         new_realized = old_realized + partial_realized_pnl
                         hedge_put_pos["realized_pnl"] = new_realized
                         print(f"[TP]   Realized PnL: ${old_realized:.2f} + ${partial_realized_pnl:.2f} = ${new_realized:.2f}")
+                        
+                        # Calculate weighted average close price for multiple partial exits
+                        previous_exit_qty = self.init_hedge_qty - old_qty  # Total quantity exited before this exit
+                        new_exit_qty = hedge_put_exit_qty
+                        existing_close_price = hedge_put_pos.get("close_price")
+                        
+                        if existing_close_price is not None and previous_exit_qty > 0:
+                            # Weighted average: (old_avg * old_qty + new_price * new_qty) / total_exit_qty
+                            total_exit_qty = previous_exit_qty + new_exit_qty
+                            weighted_avg_close = (existing_close_price * previous_exit_qty + exit_price * new_exit_qty) / total_exit_qty
+                            hedge_put_pos["close_price"] = weighted_avg_close
+                            print(f"[TP]   Average Close Price: ${weighted_avg_close:.4f} (from ${previous_exit_qty} @ ${existing_close_price:.4f} + {new_exit_qty} @ ${exit_price:.4f})")
+                        else:
+                            # First partial exit, use current exit price
+                            hedge_put_pos["close_price"] = exit_price
+                            print(f"[TP]   Close Price: ${exit_price:.4f} (first partial exit)")
+                        
+                        # Update order_id_exit with latest order ID
+                        hedge_put_order_id = hedge_put_resp.get("order_id") if hedge_put_resp else None
+                        if hedge_put_order_id is not None:
+                            hedge_put_pos["order_id_exit"] = int(hedge_put_order_id)
+                            print(f"[TP]   Exit Order ID: {hedge_put_pos['order_id_exit']}")
                     
                     hedge_put_pos["qty"] = self.curr_hedge_qty
                     hedge_put_pos["last_update"] = datetime.now(self.tz).isoformat()
@@ -1119,6 +1261,11 @@ class Strategy:
     # POSITION MANAGEMENT
     def manage_positions(self, poll_interval):
         while True:
+            if self.manager.paused:
+                print(f"[Strategy-{self.strike_offset}] Paused - waiting...")
+                time_mod.sleep(5)
+                continue
+
             print("\n---------------------------")
             print("[MANAGE] Managing Position")
             print("---------------------------")
@@ -1211,25 +1358,21 @@ class Strategy:
             # --------------------
             # VWAP EXIT CHECK
             # --------------------
-            vwap_exit_level = self.vwap * self.exit_vwap_mult
+            if self.vwap is not None:
+                vwap_exit_level = self.vwap * self.exit_vwap_mult
 
-            # Calculate current combined premium for VWAP exit check (using bid for SELL positions)
-            current_combined = ac.get("bid", ac.get("last_price", 0)) + ap.get("bid", ap.get("last_price", 0))
-            if self.enable_hedges:
-                hc = get_position_by_id(self.otm_call_id, self.account, self.symbol) if self.otm_call_id else None
-                hp = get_position_by_id(self.otm_put_id, self.account, self.symbol) if self.otm_put_id else None
-                if hc:
-                    current_combined += hc.get("ask", hc.get("last_price", 0))  # BUY position uses ask
-                if hp:
-                    current_combined += hp.get("ask", hp.get("last_price", 0))  # BUY position uses ask
-            
-            print(f"[MANAGE] VWAP EXIT → current: {current_combined:.4f}, "
-                f"required: > {vwap_exit_level:.4f} "
-                f"(vwap={self.vwap:.4f}, mult={self.exit_vwap_mult})")
+                # Calculate current combined premium for VWAP exit check (using bid for SELL positions)
+                current_combined = ac.get("bid", ac.get("last_price", 0)) + ap.get("bid", ap.get("last_price", 0))
+                
+                print(f"[MANAGE] VWAP EXIT → current: {current_combined:.4f}, "
+                    f"required: > {vwap_exit_level:.4f} "
+                    f"(vwap={self.vwap:.4f}, mult={self.exit_vwap_mult})")
 
-            # if current > vwap_exit_level:
-            #     print("[MANAGE] VWAP EXIT Triggered")
-            #     return self.exit_position("VWAP EXIT")
+                if current_combined > vwap_exit_level:
+                    print("[MANAGE] VWAP EXIT Triggered")
+                    return self.exit_position("VWAP EXIT")
+            else:
+                print("[MANAGE] VWAP not calculated yet - skipping VWAP exit check")
 
 
             # --------------------
@@ -1650,7 +1793,7 @@ class StrategyBroker:
 
             # Single IBBroker instance shared across all strategies
             # IBBroker has its own internal lock for thread safety
-            self.ib_broker = IBBroker()
+            self.ib_broker = IBBroker(config_path=config_path)
             self.ib_broker.connect_to_ibkr(host, port, client_id)
         else:
             self.ib_broker = None
@@ -1908,7 +2051,24 @@ if __name__ == "__main__":
         try:
             start, end = map(int, args.range.split(":"))
             strike_range = list(range(start, end + 1))
-            print(f"[Main] Parsed strike range: {strike_range}")
+            # Parse exclude list (comma, semicolon, or space separated)
+            exclude_set = set()
+            if args.exclude and args.exclude.strip():
+                for part in args.exclude.replace(";", ",").split(","):
+                    for num in part.split():
+                        try:
+                            exclude_set.add(int(num.strip()))
+                        except ValueError:
+                            pass
+                if exclude_set:
+                    strike_range = [x for x in strike_range if x not in exclude_set]
+                    strike_range.sort()
+                    print(f"[Main] Excluded offsets: {sorted(exclude_set)} → strike range: {strike_range}")
+            if not strike_range:
+                print(f"[Main] Range empty after exclusions. Using default [0]")
+                strike_range = [0]
+            else:
+                print(f"[Main] Parsed strike range: {strike_range}")
         except ValueError:
             print(f"[Main] Invalid range format '{args.range}'. Using default [0]")
             strike_range = [0]

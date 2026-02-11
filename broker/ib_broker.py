@@ -7,22 +7,35 @@ import time
 import pandas as pd
 from ibapi.order import Order
 import logging
+import json
+import os
 
 # Disable IBKR API verbose logging
 logging.getLogger('ibapi').setLevel(logging.CRITICAL)
 
 
 class IBBroker(EWrapper, EClient):
-    def __init__(self):
+    def __init__(self, config_path="config.json"):
         EClient.__init__(self, self)
         self.prices = {}
         self.historical_data = {}
         self.order_status = {}
+        self.executions = {} 
         self.lock = threading.Lock()
         self.connected = False
         self.next_valid_id = None
         # Set minimum API version to support fractional shares (version 163+)
         self.minVersion = 163
+        
+        # Load trading_class from config
+        self.trading_class = ""
+        try:
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
+                    config = json.load(f)
+                    self.trading_class = config.get("underlying", {}).get("trading_class", "")
+        except Exception as e:
+            print(f"[IBBroker] Warning: Could not load trading_class from config: {e}")
 
 
 
@@ -43,6 +56,8 @@ class IBBroker(EWrapper, EClient):
             c.strike = float(strike)
             c.right = right
             c.multiplier = "100"
+            if self.trading_class:
+                c.tradingClass = self.trading_class
 
         return c
 
@@ -411,6 +426,8 @@ class IBBroker(EWrapper, EClient):
         contract.strike = float(strike)
         contract.right = right  # "C" or "P"
         contract.multiplier = "100"
+        if self.trading_class:
+            contract.tradingClass = self.trading_class
 
         # Request market data
         self.reqMktData(reqId, contract, "", False, False, [])
@@ -457,6 +474,8 @@ class IBBroker(EWrapper, EClient):
         contract.strike = float(strike)
         contract.right = right
         contract.multiplier = "100"
+        if self.trading_class:
+            contract.tradingClass = self.trading_class
 
         # request option data + greeks
         self.reqMktData(req_id, contract, "100,101", False, False, [])
@@ -490,6 +509,8 @@ class IBBroker(EWrapper, EClient):
         contract.strike = float(strike)
         contract.right = right
         contract.multiplier = "100"
+        if self.trading_class:
+            contract.tradingClass = self.trading_class
 
         # Request historical bars
         self.reqHistoricalData(
@@ -527,7 +548,24 @@ class IBBroker(EWrapper, EClient):
 
         return ohlc
     
-    def place_market_option_order(self, symbol, exchange, expiry, strike, right, action, quantity, reqid, wait_until_filled=False):
+    def execDetails(self, reqId, contract, execution):
+        with self.lock:
+            self.executions.setdefault(reqId, []).append(execution)
+            print(f"[IBAPI] execDetails received for reqId {reqId}: price={execution.price}, shares={execution.shares}")
+
+
+    def place_market_option_order(
+        self,
+        symbol,
+        exchange,
+        expiry,
+        strike,
+        right,
+        action,
+        quantity,
+        reqid,
+        wait_until_filled=False
+    ):
         contract = Contract()
         contract.symbol = symbol
         contract.secType = "OPT"
@@ -536,9 +574,11 @@ class IBBroker(EWrapper, EClient):
         contract.lastTradeDateOrContractMonth = expiry
         contract.strike = float(strike)
         contract.right = right
+        if self.trading_class:
+            contract.tradingClass = self.trading_class
 
         order = Order()
-        order.action = action 
+        order.action = action
         order.totalQuantity = abs(int(quantity))
         order.orderType = "MKT"
         order.eTradeOnly = False
@@ -553,7 +593,7 @@ class IBBroker(EWrapper, EClient):
             print(f"[IBAPI ERROR] Failed to place option order: {e}")
             return None, None
 
-        timeout = 20  # seconds
+        timeout = 20
         waited = 0
 
         while True:
@@ -561,43 +601,50 @@ class IBBroker(EWrapper, EClient):
             waited += 0.2
 
             with self.lock:
-                status_data = self.order_status.get(reqid, {})
-                status = status_data.get("status")
-                fill_price = status_data.get("avgFillPrice")
-
+                status = self.order_status.get(reqid, {}).get("status")
+                fills = self.executions.get(reqid, [])
+                last_fill_price_from_status = self.order_status.get(reqid, {}).get("lastFillPrice")
+                
+                # Check if order is filled - use execution price if available, otherwise use lastFillPrice from orderStatus
                 if status == "Filled":
-                    print(f"[IBAPI] Order Filled → Price: {fill_price}")
-                    return reqid, fill_price
+                    if fills:
+                        last_fill_price = fills[-1].price
+                        print(f"[IBAPI] Order Filled → Last Fill Price: {last_fill_price} (from execDetails)")
+                        return reqid, last_fill_price
+                    elif last_fill_price_from_status and last_fill_price_from_status > 0:
+                        print(f"[IBAPI] Order Filled → Last Fill Price: {last_fill_price_from_status} (from orderStatus)")
+                        return reqid, last_fill_price_from_status
 
-                if fill_price not in [None, 0]:
-                    print(f"[IBAPI] Partial Fill → Price: {fill_price}")
-                    if not wait_until_filled:
-                        return reqid, fill_price
-                    # If waiting indefinitely → keep waiting
+                # Partial fill - use execution price if available
+                if fills and not wait_until_filled:
+                    last_fill_price = fills[-1].price
+                    print(f"[IBAPI] Partial Fill → Last Fill Price: {last_fill_price}")
+                    return reqid, last_fill_price
 
-            # ---- TIMEOUT MODE ----
             if not wait_until_filled and waited >= timeout:
                 print(f"[IBAPI] Order not filled in {timeout}s → Cancelling OrderId {reqid}")
                 try:
                     self.cancelOrder(reqid)
                 except:
                     pass
-                break  # exit wait loop
+                break
 
-        # ---------------------------------------------
-        # AFTER TIMEOUT → CHECK FOR LATE PARTIAL FILLS
-        # ---------------------------------------------
         time.sleep(1)
         with self.lock:
-            status_data = self.order_status.get(reqid, {})
-            fill_price = status_data.get("avgFillPrice", None)
-
-            if fill_price not in [None, 0]:
-                print(f"[IBAPI] Received late partial fill → Price: {fill_price}")
-                return reqid, fill_price
+            fills = self.executions.get(reqid, [])
+            last_fill_price_from_status = self.order_status.get(reqid, {}).get("lastFillPrice")
+            
+            if fills:
+                last_fill_price = fills[-1].price
+                print(f"[IBAPI] Late Fill Received → Last Fill Price: {last_fill_price} (from execDetails)")
+                return reqid, last_fill_price
+            elif last_fill_price_from_status and last_fill_price_from_status > 0:
+                print(f"[IBAPI] Late Fill Received → Last Fill Price: {last_fill_price_from_status} (from orderStatus)")
+                return reqid, last_fill_price_from_status
 
         print(f"[IBAPI] Order cancelled with NO fills.")
         return reqid, None
+
 
             
 

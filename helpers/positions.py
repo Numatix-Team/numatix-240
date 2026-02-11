@@ -55,17 +55,31 @@ def parse_ib_datetime(ts, target_tz):
 # POSITION HELPERS
 # =========================================================
 
-def generate_position_id(symbol, strike, right, tz):
-    time_str = datetime.now(tz).strftime("%Y-%m-%dT%H-%M-%S")
+def generate_position_id(symbol, strike, right, tz, position_type=None, strike_offset=None):
+    """Generate a unique position ID.
+    
+    For hedges (OTM positions), includes strike_offset to ensure uniqueness across strategies.
+    For ATM positions, includes microseconds for sub-second precision.
+    """
+    now = datetime.now(tz)
+    time_str = now.strftime("%Y-%m-%dT%H-%M-%S")
     epoch = int(time.time())
-    return f"{epoch}_{symbol}_{strike}{right}_{time_str}"
+    
+    # For hedges (OTM), include strike_offset to differentiate between strategies
+    # that share the same hedge strike but have different offsets
+    if position_type == "OTM" and strike_offset is not None:
+        return f"{epoch}_{symbol}_{strike}{right}_offset{strike_offset}_{time_str}"
+    else:
+        # For ATM positions, use microseconds for sub-second precision
+        microseconds = now.microsecond
+        return f"{epoch}_{microseconds}_{symbol}_{strike}{right}_{time_str}"
 
 
 def create_position_entry(
     account, symbol, expiry, strike, right, side, qty,
-    entry_price, order_id, position_type, tz, bid=0, ask=0
+    entry_price, order_id, position_type, tz, bid=0, ask=0, strike_offset=None
 ):
-    pos_id = generate_position_id(symbol, strike, right, tz)
+    pos_id = generate_position_id(symbol, strike, right, tz, position_type=position_type, strike_offset=strike_offset)
     now = datetime.now(tz).isoformat()
 
     pos = {
