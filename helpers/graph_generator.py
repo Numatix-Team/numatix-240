@@ -218,14 +218,49 @@ def generate_graph(symbol, expiry, strike, config_path="config.json", duration="
             print(f"[DEBUG] ERROR: No OHLC data available")
             raise ValueError("No OHLC data available")
         
-        # Merge call and put data on timestamp
+        # Merge call and put data on timestamp using outer join to preserve all timestamps
+        # This is important because one option might have more trading activity than the other
         print(f"[DEBUG] Merging call and put data...")
-        df = call_ohlc.merge(put_ohlc, on="time", suffixes=("_call", "_put"))
-        print(f"[DEBUG] Merged dataframe shape: {df.shape}")
+        print(f"[DEBUG] Call data time range: {call_ohlc['time'].min()} to {call_ohlc['time'].max()}")
+        print(f"[DEBUG] Put data time range: {put_ohlc['time'].min()} to {put_ohlc['time'].max()}")
+        
+        # Use outer join to keep all timestamps from both datasets
+        df = call_ohlc.merge(put_ohlc, on="time", how="outer", suffixes=("_call", "_put"))
+        print(f"[DEBUG] Merged dataframe shape (outer join): {df.shape}")
+        
+        # Sort by time to ensure proper ordering for forward fill
+        df = df.sort_values('time').reset_index(drop=True)
+        
+        # Forward fill missing values (use last known price if current timestamp is missing)
+        # This allows us to use the most recent price when one option doesn't have data at a specific time
+        numeric_cols = ['open', 'high', 'low', 'close', 'volume']
+        for col in numeric_cols:
+            call_col = f"{col}_call"
+            put_col = f"{col}_put"
+            if call_col in df.columns:
+                df[call_col] = df[call_col].ffill()
+            if put_col in df.columns:
+                df[put_col] = df[put_col].ffill()
+        
+        # Backward fill any remaining NaN values at the beginning (use first known price)
+        for col in numeric_cols:
+            call_col = f"{col}_call"
+            put_col = f"{col}_put"
+            if call_col in df.columns:
+                df[call_col] = df[call_col].bfill()
+            if put_col in df.columns:
+                df[put_col] = df[put_col].bfill()
+        
+        print(f"[DEBUG] After forward/backward fill: {df.shape}")
+        
+        # Now filter out rows where we still don't have both call and put data
+        # (shouldn't happen after fill, but be safe)
+        df = df.dropna(subset=['close_call', 'close_put'])
+        print(f"[DEBUG] After dropping rows with missing close prices: {df.shape}")
         
         if df.empty:
-            print(f"[DEBUG] ERROR: No overlapping timestamps")
-            raise ValueError("No overlapping timestamps between call and put data")
+            print(f"[DEBUG] ERROR: No valid data after merge")
+            raise ValueError("No valid data after merging call and put data")
         
         # Filter to market hours
         print(f"[DEBUG] Filtering to market hours...")

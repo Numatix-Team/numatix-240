@@ -9,6 +9,7 @@ from datetime import datetime
 import pytz
 import time
 from db.position_db import PositionDB
+from db.multi_account_db import MultiAccountDB
 from helpers.state_manager import (
     set_account_paused, set_account_stopped, 
     is_account_paused, is_account_stopped,
@@ -16,8 +17,8 @@ from helpers.state_manager import (
 )
 python_path = sys.executable
 
-# Database instance
-_db = PositionDB()
+# Database instance - use MultiAccountDB to query across all account+symbol databases
+_db = MultiAccountDB()
 
 # Eastern timezone
 EASTERN_TZ = pytz.timezone("US/Eastern")
@@ -220,6 +221,14 @@ def edit_config_page():
         underlying["exchange"] = st.text_input("Exchange", underlying["exchange"])
     with col3:
         underlying["currency"] = st.text_input("Currency", underlying["currency"])
+    
+    col4, col5, col6 = st.columns(3)
+    with col4:
+        underlying["trading_class"] = st.text_input("Trading Class", underlying.get("trading_class", ""))
+    with col5:
+        st.write("")
+    with col6:
+        st.write("")
 
     st.markdown("---")
 
@@ -253,13 +262,11 @@ def edit_config_page():
     with col3:
         tp["strike_step"] = st.number_input("Strike Step", value=tp["strike_step"])
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     with col1:
-        tp["atm_call_offset"] = st.number_input("ATM Call Offset", value=tp["atm_call_offset"])
-    with col2:
-        tp["atm_put_offset"] = st.number_input("ATM Put Offset", value=tp["atm_put_offset"])
-    with col3:
         tp["max_bid_ask_spread"] = st.number_input("Max Bid/Ask Spread", value=tp["max_bid_ask_spread"])
+    with col2:
+        st.write("")  # Empty column for layout
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -425,16 +432,8 @@ def positions_page():
         
         positions.append(p)
     
-    active_positions = [p for p in positions if p.get("active", False)]
-    
-    # Build active IDs from filtered active positions (today only)
-    active_ids = {
-        "position_open": len(active_positions) > 0,
-        "atm_call_id": next((p["id"] for p in active_positions if p.get("position_type") == "ATM" and p.get("right") == "C"), None),
-        "atm_put_id": next((p["id"] for p in active_positions if p.get("position_type") == "ATM" and p.get("right") == "P"), None),
-        "otm_call_id": next((p["id"] for p in active_positions if p.get("position_type") == "OTM" and p.get("right") == "C"), None),
-        "otm_put_id": next((p["id"] for p in active_positions if p.get("position_type") == "OTM" and p.get("right") == "P"), None),
-    }
+    # Removed active positions tracking since we're running multiple threads with different strikes
+    # Each thread manages its own positions independently
 
     # ------------------------------------
     # Compute PnL from database fields (today only)
@@ -496,28 +495,6 @@ def positions_page():
     st.markdown("---")
 
     # ------------------------------------
-    # ACTIVE POSITIONS
-    # ------------------------------------
-    st.subheader("Active Positions")
-
-    if not active_ids["position_open"]:
-        st.info("No active positions.")
-    else:
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.write("### ATM Positions")
-            st.write(f"**ATM Call ID:** {active_ids.get('atm_call_id')}")
-            st.write(f"**ATM Put ID:** {active_ids.get('atm_put_id')}")
-
-        with col2:
-            st.write("### OTM Positions")
-            st.write(f"**OTM Call ID:** {active_ids.get('otm_call_id')}")
-            st.write(f"**OTM Put ID:** {active_ids.get('otm_put_id')}")
-
-    st.markdown("---")
-
-    # ------------------------------------
     # ALL POSITIONS TABLE
     # ------------------------------------
     table_filter_text = f"Today's Positions (Eastern Time: {today_str})"
@@ -534,6 +511,10 @@ def positions_page():
     df = pd.DataFrame(positions)
 
     # Note: Using realized_pnl and unrealized_pnl fields from database
+
+    # Remove fields that shouldn't be displayed in frontend (but keep in database)
+    columns_to_hide = ['id', 'order_id_entry', 'order_id_exit', 'last_update', 'bid', 'ask', 'last', 'expiry', 'side']
+    df = df.drop(columns=[col for col in columns_to_hide if col in df.columns])
 
     # Safe datetime conversion
     df["entry_time"] = pd.to_datetime(df["entry_time"], errors="coerce")
@@ -563,10 +544,127 @@ def update_flags(paused=None, stopped=None):
     save_json(CONFIG_PATH, config)
 
 # -------------------------------------
+# HELPER: Display historical data
+# -------------------------------------
+def _display_historical_data(positions, filters=None):
+    """Helper function to display historical data results"""
+    # Display summary
+    st.markdown("---")
+    st.subheader("Summary Statistics")
+    
+    # Calculate realized PnL (only for closed positions)
+    closed_positions = [p for p in positions if not p.get("active", False)]
+    realized_pnl = sum(p.get("realized_pnl", 0) or 0 for p in closed_positions)
+    
+    # Additional stats
+    total_positions = len(positions)
+    closed_count = len(closed_positions)
+    active_count = total_positions - closed_count
+    
+    wins = [p.get("realized_pnl", 0) or 0 for p in closed_positions if (p.get("realized_pnl", 0) or 0) > 0]
+    losses = [p.get("realized_pnl", 0) or 0 for p in closed_positions if (p.get("realized_pnl", 0) or 0) < 0]
+    
+    win_rate = (len(wins) / closed_count * 100) if closed_count > 0 else 0
+    avg_win = (sum(wins) / len(wins)) if wins else 0
+    avg_loss = (sum(losses) / len(losses)) if losses else 0
+    total_wins = sum(wins)
+    total_losses = sum(losses)
+    
+    # Display metrics
+    row1 = st.columns(4)
+    with row1[0]:
+        st.metric("Total Positions", total_positions)
+    with row1[1]:
+        st.metric("Closed Positions", closed_count)
+    with row1[2]:
+        st.metric("Active Positions", active_count)
+    with row1[3]:
+        st.metric("Total Realized PnL", f"${realized_pnl:.2f}")
+    
+    row2 = st.columns(4)
+    with row2[0]:
+        st.metric("Win Rate", f"{win_rate:.2f}%")
+    with row2[1]:
+        st.metric("Total Wins", f"${total_wins:.2f}")
+    with row2[2]:
+        st.metric("Total Losses", f"${total_losses:.2f}")
+    with row2[3]:
+        st.metric("Avg Win", f"${avg_win:.2f}")
+    
+    row3 = st.columns(4)
+    with row3[0]:
+        st.metric("Avg Loss", f"${avg_loss:.2f}")
+    with row3[1]:
+        st.metric("Winning Trades", len(wins))
+    with row3[2]:
+        st.metric("Losing Trades", len(losses))
+    with row3[3]:
+        profit_factor = abs(total_wins / total_losses) if total_losses != 0 else float('inf') if total_wins > 0 else 0
+        st.metric("Profit Factor", f"{profit_factor:.2f}" if profit_factor != float('inf') else "∞")
+    
+    # Display detailed table
+    st.markdown("---")
+    st.subheader("Position Details")
+    
+    # Prepare data for display (excluding hidden fields)
+    display_data = []
+    for p in positions:
+        display_data.append({
+            "Account": p.get("account", ""),
+            "Symbol": p.get("symbol", ""),
+            "Type": p.get("position_type", ""),
+            "Right": p.get("right", ""),
+            "Strike": p.get("strike", 0),
+            "Qty": p.get("qty", 0),
+            "Entry Time": p.get("entry_time", ""),
+            "Exit Time": p.get("exit_time", ""),
+            "Entry Price": f"${p.get('entry_price', 0):.2f}" if p.get("entry_price") else "N/A",
+            "Close Price": f"${p.get('close_price', 0):.2f}" if p.get("close_price") else "N/A",
+            "Realized PnL": f"${p.get('realized_pnl', 0):.2f}" if p.get("realized_pnl") else "$0.00",
+            "Unrealized PnL": f"${p.get('unrealized_pnl', 0):.2f}" if p.get("unrealized_pnl") else "$0.00",
+            "Active": "Yes" if p.get("active") else "No"
+        })
+    
+    df = pd.DataFrame(display_data)
+    
+    # Display dataframe
+    st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True
+    )
+    
+    # Download button
+    csv = df.to_csv(index=False)
+    if filters:
+        account_display = filters.get("account") or "all"
+        symbol_display = filters.get("symbol") or "all"
+        start_display = filters.get("start_date") or "all"
+        end_display = filters.get("end_date") or "all"
+    else:
+        account_display = "all"
+        symbol_display = "all"
+        start_display = "all"
+        end_display = "all"
+    
+    st.download_button(
+        label="Download as CSV",
+        data=csv,
+        file_name=f"historical_data_{account_display}_{symbol_display}_{start_display}_{end_display}.csv",
+        mime="text/csv"
+    )
+
+# -------------------------------------
 # HISTORICAL DATA PAGE
 # -------------------------------------
 def historical_data_page():
     st.header("Historical Data Analysis")
+    
+    # Initialize session state for historical data
+    if "historical_data" not in st.session_state:
+        st.session_state.historical_data = None
+    if "historical_filters" not in st.session_state:
+        st.session_state.historical_filters = None
     
     # Filters section
     st.subheader("Filters")
@@ -614,6 +712,13 @@ def historical_data_page():
         st.error("Start date must be before or equal to end date.")
         return
     
+    # Clear data button
+    if st.session_state.historical_data is not None:
+        if st.button("Clear Results", type="secondary"):
+            st.session_state.historical_data = None
+            st.session_state.historical_filters = None
+            st.rerun()
+    
     # Query button
     if st.button("Query Historical Data", type="primary"):
         # Format dates for database query
@@ -628,107 +733,33 @@ def historical_data_page():
             end_date=end_date_str
         )
         
+        # Store in session state
+        st.session_state.historical_data = positions
+        st.session_state.historical_filters = {
+            "account": account,
+            "symbol": symbol,
+            "start_date": start_date_str,
+            "end_date": end_date_str
+        }
+        
         if not positions:
             st.warning("No positions found matching the selected criteria.")
+            st.session_state.historical_data = None
+            st.session_state.historical_filters = None
             return
         
-        # Display summary
-        st.markdown("---")
-        st.subheader("Summary Statistics")
+        # Display the data using helper function
+        _display_historical_data(positions, st.session_state.historical_filters)
+    
+    # Display stored data if available (when page refreshes but data is in session state)
+    elif st.session_state.historical_data is not None:
+        positions = st.session_state.historical_data
+        filters = st.session_state.historical_filters
         
-        # Calculate realized PnL (only for closed positions)
-        closed_positions = [p for p in positions if not p.get("active", False)]
-        realized_pnl = sum(p.get("realized_pnl", 0) or 0 for p in closed_positions)
+        st.info("📊 Displaying previously queried data. Auto-refresh is disabled. Click 'Clear Results' to enable auto-refresh again.")
         
-        # Additional stats
-        total_positions = len(positions)
-        closed_count = len(closed_positions)
-        active_count = total_positions - closed_count
-        
-        wins = [p.get("realized_pnl", 0) or 0 for p in closed_positions if (p.get("realized_pnl", 0) or 0) > 0]
-        losses = [p.get("realized_pnl", 0) or 0 for p in closed_positions if (p.get("realized_pnl", 0) or 0) < 0]
-        
-        win_rate = (len(wins) / closed_count * 100) if closed_count > 0 else 0
-        avg_win = (sum(wins) / len(wins)) if wins else 0
-        avg_loss = (sum(losses) / len(losses)) if losses else 0
-        total_wins = sum(wins)
-        total_losses = sum(losses)
-        
-        # Display metrics
-        row1 = st.columns(4)
-        with row1[0]:
-            st.metric("Total Positions", total_positions)
-        with row1[1]:
-            st.metric("Closed Positions", closed_count)
-        with row1[2]:
-            st.metric("Active Positions", active_count)
-        with row1[3]:
-            st.metric("Total Realized PnL", f"${realized_pnl:.2f}")
-        
-        row2 = st.columns(4)
-        with row2[0]:
-            st.metric("Win Rate", f"{win_rate:.2f}%")
-        with row2[1]:
-            st.metric("Total Wins", f"${total_wins:.2f}")
-        with row2[2]:
-            st.metric("Total Losses", f"${total_losses:.2f}")
-        with row2[3]:
-            st.metric("Avg Win", f"${avg_win:.2f}")
-        
-        row3 = st.columns(4)
-        with row3[0]:
-            st.metric("Avg Loss", f"${avg_loss:.2f}")
-        with row3[1]:
-            st.metric("Winning Trades", len(wins))
-        with row3[2]:
-            st.metric("Losing Trades", len(losses))
-        with row3[3]:
-            profit_factor = abs(total_wins / total_losses) if total_losses != 0 else float('inf') if total_wins > 0 else 0
-            st.metric("Profit Factor", f"{profit_factor:.2f}" if profit_factor != float('inf') else "∞")
-        
-        # Display detailed table
-        st.markdown("---")
-        st.subheader("Position Details")
-        
-        # Prepare data for display
-        display_data = []
-        for p in positions:
-            display_data.append({
-                "ID": p.get("id", ""),
-                "Account": p.get("account", ""),
-                "Symbol": p.get("symbol", ""),
-                "Expiry": p.get("expiry", ""),
-                "Type": p.get("position_type", ""),
-                "Right": p.get("right", ""),
-                "Side": p.get("side", ""),
-                "Strike": p.get("strike", 0),
-                "Qty": p.get("qty", 0),
-                "Entry Time": p.get("entry_time", ""),
-                "Exit Time": p.get("exit_time", ""),
-                "Entry Price": f"${p.get('entry_price', 0):.2f}" if p.get("entry_price") else "N/A",
-                "Close Price": f"${p.get('close_price', 0):.2f}" if p.get("close_price") else "N/A",
-                "Realized PnL": f"${p.get('realized_pnl', 0):.2f}" if p.get("realized_pnl") else "$0.00",
-                "Unrealized PnL": f"${p.get('unrealized_pnl', 0):.2f}" if p.get("unrealized_pnl") else "$0.00",
-                "Active": "Yes" if p.get("active") else "No"
-            })
-        
-        df = pd.DataFrame(display_data)
-        
-        # Display dataframe
-        st.dataframe(
-            df,
-            use_container_width=True,
-            hide_index=True
-        )
-        
-        # Download button
-        csv = df.to_csv(index=False)
-        st.download_button(
-            label="Download as CSV",
-            data=csv,
-            file_name=f"historical_data_{account or 'all'}_{symbol or 'all'}_{start_date_str or 'all'}_{end_date_str or 'all'}.csv",
-            mime="text/csv"
-        )
+        # Display the data using helper function
+        _display_historical_data(positions, filters)
 
 
 
@@ -879,6 +910,13 @@ def main():
             help="Ending offset value (e.g., 2 means ATM+2)"
         )
     
+    exclude_offsets = st.text_input(
+        "Exclude offsets (optional)",
+        value="",
+        placeholder="e.g. 5, 7 or 5;7 or 5 7",
+        help="Numbers to exclude from the range above. Use comma, semicolon, or space as separator."
+    )
+    
     if range_start > range_end:
         st.error("Range start must be less than or equal to range end")
         strike_range_str = None
@@ -907,8 +945,10 @@ def main():
                     set_account_paused(account, False, symbol)
                     set_account_stopped(account, False, symbol)
                     
-                    # Simple: just pass the 4 arguments
+                    # Build command: account, symbol, range, and optional exclude
                     cmd_args = [python_path, main_path, '--account', account, '--symbol', symbol, '--range', strike_range_str]
+                    if exclude_offsets and exclude_offsets.strip():
+                        cmd_args.extend(['--exclude', exclude_offsets.strip()])
                     
                     if os.name == 'nt':  # Windows
                         # Use CREATE_NEW_CONSOLE to open in new window
@@ -924,7 +964,8 @@ def main():
                         p = subprocess.Popen(cmd_args, cwd=base_dir)
                         save_pid(p.pid, account, symbol)
                     
-                    st.success(f"Started {account} | {symbol} | Range: {strike_range_str}")
+                    range_display = strike_range_str + (f" (exclude: {exclude_offsets.strip()})" if exclude_offsets and exclude_offsets.strip() else "")
+                    st.success(f"Started {account} | {symbol} | Range: {range_display}")
                     time.sleep(1)  # Give it a moment to start
                     st.rerun()
                 except Exception as e:
@@ -946,7 +987,10 @@ def main():
     with tab3:
         historical_data_page()
     
-    st_autorefresh(interval=5000, limit=None, key="auto_refresh")
+    # Only auto-refresh if there's no historical data in session state
+    # This prevents losing queried data on the historical data page
+    if "historical_data" not in st.session_state or st.session_state.historical_data is None:
+        st_autorefresh(interval=5000, limit=None, key="auto_refresh")
 
 # -------------------------------------
 # ENTRY POINT

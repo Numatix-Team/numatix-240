@@ -5,7 +5,7 @@
   },
   "acc1_SPX": {
     "paused": false,
-    "stopped": true
+    "stopped": false
   },
   "acc1_XSP": {
     "paused": false,
@@ -22,5 +22,9 @@
   "Vedansh_XSP": {
     "paused": false,
     "stopped": false
+  },
+  "default_default": {
+    "paused": false,
+    "stopped": true
   }
 }

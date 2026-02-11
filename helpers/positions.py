@@ -55,17 +55,31 @@ def parse_ib_datetime(ts, target_tz):
 # POSITION HELPERS
 # =========================================================
 
-def generate_position_id(symbol, strike, right, tz):
-    time_str = datetime.now(tz).strftime("%Y-%m-%dT%H-%M-%S")
+def generate_position_id(symbol, strike, right, tz, position_type=None, strike_offset=None):
+    """Generate a unique position ID.
+    
+    For hedges (OTM positions), includes strike_offset to ensure uniqueness across strategies.
+    For ATM positions, includes microseconds for sub-second precision.
+    """
+    now = datetime.now(tz)
+    time_str = now.strftime("%Y-%m-%dT%H-%M-%S")
     epoch = int(time.time())
-    return f"{epoch}_{symbol}_{strike}{right}_{time_str}"
+    
+    # For hedges (OTM), include strike_offset to differentiate between strategies
+    # that share the same hedge strike but have different offsets
+    if position_type == "OTM" and strike_offset is not None:
+        return f"{epoch}_{symbol}_{strike}{right}_offset{strike_offset}_{time_str}"
+    else:
+        # For ATM positions, use microseconds for sub-second precision
+        microseconds = now.microsecond
+        return f"{epoch}_{microseconds}_{symbol}_{strike}{right}_{time_str}"
 
 
 def create_position_entry(
     account, symbol, expiry, strike, right, side, qty,
-    entry_price, order_id, position_type, tz, bid=0, ask=0
+    entry_price, order_id, position_type, tz, bid=0, ask=0, strike_offset=None
 ):
-    pos_id = generate_position_id(symbol, strike, right, tz)
+    pos_id = generate_position_id(symbol, strike, right, tz, position_type=position_type, strike_offset=strike_offset)
     now = datetime.now(tz).isoformat()
 
     pos = {
@@ -87,7 +101,7 @@ def create_position_entry(
         "bid": bid,
         "ask": ask,
         "last_price": entry_price,
-        "order_id_entry": order_id,
+        "order_id_entry": int(order_id) if order_id is not None else None,
         "order_id_exit": None,
         "last_update": now,
         "realized_pnl": 0.0,
@@ -177,31 +191,40 @@ def load_active_ids(account=None, symbol=None):
 
 
 def save_active_ids(position_open, atm_call_id, atm_put_id, otm_call_id, otm_put_id, account=None, symbol=None):
-    """Save active position IDs by updating active field in database."""
+    """Save active position IDs by updating active field in database based on quantity.
+    
+    IMPORTANT: Only updates the specific position IDs passed in. Does NOT touch other positions.
+    This is critical for multi-threaded scenarios where multiple strategies run simultaneously.
+    """
     if not account or not symbol:
         raise ValueError("account and symbol are required for save_active_ids")
     
     db = get_db(account, symbol)
     
-    # Set all positions to inactive if position_open is False
-    if not position_open:
-        active_positions = db.get_active_positions(account=None, symbol=None)
-        for pos in active_positions:
-            db.update_position(pos["id"], {"active": 0})
-        return
+    # Update active status for specific positions based on their quantity
+    # Active should be True if qty > 0, False if qty <= 0
+    # We only update the positions that are passed in, never touch other positions
+    def update_active_if_needed(pos_id):
+        if pos_id:
+            pos = get_position_by_id(pos_id, account, symbol)
+            if pos:
+                qty = pos.get("qty", 0)
+                should_be_active = (qty > 0)
+                current_active = pos.get("active", False)
+                # Only update if it's incorrect
+                if current_active != should_be_active:
+                    db.update_position(pos_id, {"active": 1 if should_be_active else 0})
+                    print(f"[SAVE_ACTIVE] Updated {pos_id[:20]}... active={should_be_active} (qty={qty})")
     
-    # Update active status for specific positions
-    if atm_call_id:
-        db.update_position(atm_call_id, {"active": 1})
-    if atm_put_id:
-        db.update_position(atm_put_id, {"active": 1})
-    if otm_call_id:
-        db.update_position(otm_call_id, {"active": 1})
-    if otm_put_id:
-        db.update_position(otm_put_id, {"active": 1})
+    # Always update based on quantity, regardless of position_open flag
+    # If position_open is False, we still check each position's quantity
+    update_active_if_needed(atm_call_id)
+    update_active_if_needed(atm_put_id)
+    update_active_if_needed(otm_call_id)
+    update_active_if_needed(otm_put_id)
 
-def update_position_in_json(updated_pos):
-    """Update position in database. Name kept for backward compatibility."""
+def update_position_in_db(updated_pos):
+    """Update position in database."""
     if updated_pos is None:
         return
     
@@ -216,15 +239,30 @@ def update_position_in_json(updated_pos):
     # Get account and symbol from position
     account = updated_pos.get("account")
     symbol = updated_pos.get("symbol")
+    pos_type = updated_pos.get("position_type", "UNKNOWN")
+    right = updated_pos.get("right", "")
+    strike = updated_pos.get("strike", 0)
     
     if account and symbol:
         # Use account+symbol specific database
         db = get_db(account, symbol)
         existing = db.get_position(pos_id)
         if existing:
+            # Show what's being updated
+            last_price = updated_pos.get("last_price")
+            unrealized = updated_pos.get("unrealized_pnl", 0) or 0
+            realized = updated_pos.get("realized_pnl", 0) or 0
+            qty = updated_pos.get("qty", 0)
+            last_price_str = f"${last_price:.2f}" if last_price is not None else "N/A"
+            print(f"[DB] Updating {pos_type} {right} @ Strike {strike} in {account}/{symbol} DB:")
+            print(f"[DB]   Last Price: {last_price_str}, Qty: {qty}")
+            print(f"[DB]   Realized PnL: ${realized:.2f}, Unrealized PnL: ${unrealized:.2f}")
             db.update_position(pos_id, updated_pos)
+            print(f"[DB] Update complete")
         else:
+            print(f"[DB] Inserting new {pos_type} {right} @ Strike {strike} in {account}/{symbol} DB")
             db.insert_position(updated_pos)
+            print(f"[DB] Insert complete")
     else:
         # Fallback: search all databases (less efficient)
         import glob
