@@ -5,13 +5,14 @@
         "client_id": 1
     },
     "underlying": {
-        "symbol": "XSP",
+        "symbol": "SPX",
         "exchange": "SMART",
         "currency": "USD",
-        "trading_class": "SPXW"
+        "trading_class": "SPXW",
+        "multiplier": 100
     },
     "expiry": {
-        "date": "20251231"
+        "date": "20260213"
     },
     "trade_parameters": {
         "call_quantity": 1,

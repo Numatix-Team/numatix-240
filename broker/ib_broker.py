@@ -13,6 +13,18 @@ import os
 # Disable IBKR API verbose logging
 logging.getLogger('ibapi').setLevel(logging.CRITICAL)
 
+# IBKR sometimes sends sentinel values (e.g. 1.79e+308) for invalid PnL; treat as 0
+def _sane_pnl(value):
+    if value is None:
+        return 0.0
+    try:
+        v = float(value)
+        if v != v or abs(v) > 1e12:  # nan or absurd
+            return 0.0
+        return v
+    except (TypeError, ValueError):
+        return 0.0
+
 
 class IBBroker(EWrapper, EClient):
     def __init__(self, config_path="config.json"):
@@ -30,6 +42,13 @@ class IBBroker(EWrapper, EClient):
         # Set minimum API version to support fractional shares (version 163+)
         self.minVersion = 163
         
+        # For request_all_open_positions_pnl
+        self._positions_list = []
+        self._positions_end = False
+        self._pnl_base_req_id = 7000
+        self._pnl_req_id_to_position_index = {}  # reqId -> index in _positions_list
+        self._pnl_results = {}  # reqId -> {unrealized_pnl, realized_pnl}
+
         # Load trading_class from config
         self.trading_class = ""
         try:
@@ -219,6 +238,145 @@ class IBBroker(EWrapper, EClient):
 
         # Only print actual errors
         print(f"IBKR Error {errorCode}: {errorString}")
+
+    def position(self, account, contract, pos, avgCost):
+        """Callback: one position from reqPositions()."""
+        with self.lock:
+            self._positions_list.append({
+                "account": account,
+                "contract": contract,
+                "pos": pos,
+                "avgCost": avgCost,
+                "conId": getattr(contract, "conId", None),
+            })
+
+    def positionEnd(self):
+        """Callback: end of position list from reqPositions()."""
+        with self.lock:
+            self._positions_end = True
+
+    def pnlSingle(self, reqId, pos, dailyPnL, unrealizedPnL, realizedPnL, value):
+        """Callback: PnL for one position from reqPnLSingle()."""
+        with self.lock:
+            self._pnl_results[reqId] = {
+                "pos": pos,
+                "daily_pnl": dailyPnL,
+                "unrealized_pnl": unrealizedPnL,
+                "realized_pnl": realizedPnL,
+                "value": value,
+            }
+
+    def _normalize_expiry(self, expiry):
+        """Normalize expiry to YYYYMMDD string for matching."""
+        if not expiry:
+            return ""
+        s = str(expiry).strip().replace("-", "").replace(" ", "").split(".")[0]
+        if len(s) >= 8 and s[:8].isdigit():
+            return s[:8]
+        return s
+
+    def get_all_open_positions_pnl(self, account=None):
+        """
+        Request all open positions from IBKR and their unrealized/realized PnL.
+        Returns a list of dicts: {symbol, expiry, strike, right, pos, unrealized_pnl, realized_pnl, account}.
+        Only includes OPT positions. If account is set, only that account.
+        """
+        with self.lock:
+            self._positions_list = []
+            self._positions_end = False
+            self._pnl_results = {}
+            self._pnl_req_id_to_position_index = {}
+
+        self.reqPositions()
+        # Wait for positionEnd (max 15 s)
+        for _ in range(150):
+            time.sleep(0.1)
+            with self.lock:
+                if self._positions_end:
+                    break
+        with self.lock:
+            positions = list(self._positions_list)
+            self._positions_list = []
+            self._positions_end = False
+
+        # Filter OPT only and optional account
+        opt_positions = []
+        for i, p in enumerate(positions):
+            c = p["contract"]
+            if getattr(c, "secType", "") != "OPT":
+                continue
+            if account is not None and p.get("account") != account:
+                continue
+            conId = p.get("conId")
+            if conId is None:
+                conId = getattr(c, "conId", None)
+            if conId is None:
+                continue
+            opt_positions.append({
+                "index": i,
+                "account": p["account"],
+                "symbol": c.symbol,
+                "expiry": self._normalize_expiry(getattr(c, "lastTradeDateOrContractMonth", "")),
+                "strike": float(getattr(c, "strike", 0)),
+                "right": getattr(c, "right", ""),
+                "pos": p["pos"],
+                "conId": conId,
+            })
+
+        if not opt_positions:
+            return []
+
+        # Request PnL for each position
+        req_id_to_idx = {}
+        with self.lock:
+            self._pnl_results = {}
+        for p in opt_positions:
+            req_id = self._pnl_base_req_id + p["index"]
+            req_id_to_idx[req_id] = p
+            try:
+                self.reqPnLSingle(req_id, p["account"], "", p["conId"])
+            except Exception as e:
+                print(f"[IBBroker] reqPnLSingle failed for {p['symbol']} {p['strike']}{p['right']}: {e}")
+
+        # Wait for at least one pnlSingle per request (max 15 s)
+        for _ in range(150):
+            time.sleep(0.1)
+            with self.lock:
+                if len(self._pnl_results) >= len(opt_positions):
+                    break
+                # Also accept if we have any result and waited enough
+                if len(self._pnl_results) > 0 and _ > 50:
+                    break
+
+        # Cancel subscriptions and build result
+        result = []
+        with self.lock:
+            pnl_results = dict(self._pnl_results)
+        for p in opt_positions:
+            req_id = self._pnl_base_req_id + p["index"]
+            try:
+                self.cancelPnLSingle(req_id)
+            except Exception:
+                pass
+            row = {
+                "symbol": p["symbol"],
+                "expiry": p["expiry"],
+                "strike": p["strike"],
+                "right": p["right"],
+                "pos": p["pos"],
+                "account": p["account"],
+                "unrealized_pnl": 0.0,
+                "realized_pnl": 0.0,
+            }
+            if req_id in pnl_results:
+                raw_u = pnl_results[req_id].get("unrealized_pnl")
+                raw_r = pnl_results[req_id].get("realized_pnl")
+                # IBKR can send sentinel values (e.g. 1.79e+308) for invalid/undefined; treat as 0
+                row["unrealized_pnl"] = _sane_pnl(raw_u)
+                row["realized_pnl"] = _sane_pnl(raw_r)
+            result.append(row)
+
+        return result
 
     def stock_contract(self, symbol: str):
         """Create stock contract"""

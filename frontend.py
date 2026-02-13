@@ -176,6 +176,19 @@ def load_json(path):
         return json.load(f)
 
 
+def load_accounts():
+    """Load accounts from accounts.json. Returns list of {nickname, ibkr_account_id}. Used for display (nickname) and passing ibkr_account_id to main/broker."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts.json")
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        return data.get("accounts") or []
+    except Exception:
+        return []
+
+
 def save_json(path, data):
     with open(path, "w") as f:
         json.dump(data, f, indent=4)
@@ -226,7 +239,7 @@ def edit_config_page():
     with col4:
         underlying["trading_class"] = st.text_input("Trading Class", underlying.get("trading_class", ""))
     with col5:
-        st.write("")
+        underlying["multiplier"] = st.number_input("Multiplier", value=int(underlying.get("multiplier", 100)), min_value=1, step=1, help="Contract multiplier (e.g. 100 for SPX, 10 for XSP)")
     with col6:
         st.write("")
 
@@ -384,14 +397,18 @@ def edit_config_page():
 def positions_page():
     st.header("Positions Dashboard")
 
+    accounts = load_accounts()
+    id_to_nickname = {a["ibkr_account_id"]: a["nickname"] for a in accounts} if accounts else {}
+    account_options = [None] + [a["ibkr_account_id"] for a in accounts] if accounts else [None]
+
     # Get filters
     col1, col2 = st.columns(2)
     
     with col1:
         account = st.selectbox(
             "Filter by Account",
-            [None, "acc1", "acc2", "acc3"],
-            format_func=lambda x: "All Accounts" if x is None else x,
+            account_options,
+            format_func=lambda x: "All Accounts" if x is None else id_to_nickname.get(x, x),
             index=0
         )
     
@@ -669,13 +686,17 @@ def historical_data_page():
     # Filters section
     st.subheader("Filters")
     
+    accounts = load_accounts()
+    id_to_nickname = {a["ibkr_account_id"]: a["nickname"] for a in accounts} if accounts else {}
+    account_options = [None] + [a["ibkr_account_id"] for a in accounts] if accounts else [None]
+
     col1, col2 = st.columns(2)
     
     with col1:
         account = st.selectbox(
             "Filter by Account",
-            [None, "acc1", "acc2", "acc3"],
-            format_func=lambda x: "All Accounts" if x is None else x,
+            account_options,
+            format_func=lambda x: "All Accounts" if x is None else id_to_nickname.get(x, x),
             index=0,
             key="hist_account"
         )
@@ -769,7 +790,9 @@ def historical_data_page():
 def status_indicator():
     """Show status for all running accounts with their controls"""
     running_accounts = get_all_running_accounts()
-    
+    accounts = load_accounts()
+    id_to_nickname = {a["ibkr_account_id"]: a["nickname"] for a in accounts} if accounts else {}
+
     if running_accounts:
         st.markdown("### Running Accounts")
         for acc, sym in running_accounts:
@@ -785,11 +808,13 @@ def status_indicator():
                             paused = parts[0] == "paused"
             except:
                 pass
-            
+
+            account_display = id_to_nickname.get(acc, acc)
+
             # Get state from state manager (using account+symbol)
             account_state = get_account_state(acc, sym)
             is_paused = account_state.get("paused", False)
-            
+
             col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
             with col1:
                 status_color = "#ca8a04" if is_paused else "#10b981"
@@ -799,7 +824,7 @@ def status_indicator():
                     <div style="padding:8px 15px;border-radius:6px;
                                 background:{status_color}20;border:1px solid {status_color};display:inline-block;">
                         <span style="color:{status_color};font-size:14px;font-weight:600;">
-                            ● {acc} ({symbol_info}) - {status_text}
+                            ● {account_display} ({symbol_info}) - {status_text}
                         </span>
                     </div>
                     """,
@@ -869,14 +894,21 @@ def main():
     # ===============================
     st.subheader("Run Configuration")
 
+    accounts = load_accounts()
+    # Use nickname as option so dropdown shows Vedanhs, acc2, acc3; resolve to ibkr_account_id when starting
+    nickname_to_ibkr = {a["nickname"]: a["ibkr_account_id"] for a in accounts} if accounts else {}
+    account_nicknames = [a["nickname"] for a in accounts] if accounts else ["default"]
+
     col1, col2 = st.columns(2)
 
     with col1:
-        account = st.selectbox(
+        selected_nickname = st.selectbox(
             "Select Account",
-            ["acc1", "acc2", "acc3"],
+            account_nicknames,
             index=0
         )
+        # Resolve to ibkr_account_id for PID/state/main (used below when starting)
+        account = nickname_to_ibkr.get(selected_nickname, selected_nickname)
 
     with col2:
         symbol = st.selectbox(
@@ -968,7 +1000,7 @@ def main():
                         save_pid(p.pid, account, symbol)
                     
                     range_display = strike_range_str + (f" (exclude: {exclude_offsets.strip()})" if exclude_offsets and exclude_offsets.strip() else "")
-                    st.success(f"Started {account} | {symbol} | Range: {range_display}")
+                    st.success(f"Started {selected_nickname} | {symbol} | Range: {range_display}")
                     time.sleep(1)  # Give it a moment to start
                     st.rerun()
                 except Exception as e:

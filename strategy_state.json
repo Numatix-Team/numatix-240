@@ -26,5 +26,17 @@
   "default_default": {
     "paused": false,
     "stopped": true
+  },
+  "acc3_SPX": {
+    "paused": false,
+    "stopped": true
+  },
+  "DU123456_SPX": {
+    "paused": false,
+    "stopped": false
+  },
+  "DUH300582_SPX": {
+    "paused": false,
+    "stopped": false
   }
 }

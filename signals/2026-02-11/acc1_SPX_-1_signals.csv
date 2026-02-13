@@ -1,0 +1,2 @@
+timestamp,action,combined,call_strike,put_strike,strike_offset,account,symbol,vwap
+2026-02-11T12:53:58.188721-05:00,STRATEGY_STARTED,,6950,6950,-1,acc1,SPX,
