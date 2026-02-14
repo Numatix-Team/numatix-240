@@ -1850,11 +1850,11 @@ class StrategyBroker:
         with self.counter_lock:
             req_id = self.request_id_counter + 2000
             self.request_id_counter += 1
-        try:
-            return self.ib_broker.get_index_spot(symbol, req_id, exchange)
-        except Exception as e:
-            self.ib_broker.connected = False
-            raise
+            try:
+                return self.ib_broker.get_index_spot(symbol, req_id, exchange)
+            except Exception as e:
+                self.ib_broker.connected = False
+                raise
 
     def get_option_premium(self, symbol, expiry, strike, right, test_mode=False):
         if test_mode:
@@ -1868,34 +1868,34 @@ class StrategyBroker:
         with self.counter_lock:
             req_id = self.request_id_counter + 3000
             self.request_id_counter += 1
-        try:
-            return self.ib_broker.get_option_premium(symbol, expiry, strike, right, req_id)
-        except Exception as e:
-            self.ib_broker.connected = False
-            raise
+            try:
+                return self.ib_broker.get_option_premium(symbol, expiry, strike, right, req_id)
+            except Exception as e:
+                self.ib_broker.connected = False
+                raise
 
     def get_option_tick(self, symbol, expiry, strike, right):
         self.ensure_connected()
         with self.counter_lock:
             req_id = self.request_id_counter + 5000
             self.request_id_counter += 1
-        try:
-            return self.ib_broker.get_option_tick(symbol, expiry, strike, right, req_id)
-        except Exception as e:
-            self.ib_broker.connected = False
-            raise
+            try:
+                return self.ib_broker.get_option_tick(symbol, expiry, strike, right, req_id)
+            except Exception as e:
+                self.ib_broker.connected = False
+                raise
 
     def get_option_ohlc(self, symbol, expiry, strike, right, duration="2 D", bar_size="1 min"):
         self.ensure_connected()
         with self.counter_lock:
             req_id = self.request_id_counter + 6000
             self.request_id_counter += 1
-        try:
-            x = self.ib_broker.get_option_ohlc(symbol, expiry, strike, right, duration, bar_size, req_id)
-            return pd.DataFrame(x)
-        except Exception as e:
-            self.ib_broker.connected = False
-            raise
+            try:
+                x = self.ib_broker.get_option_ohlc(symbol, expiry, strike, right, duration, bar_size, req_id)
+                return pd.DataFrame(x)
+            except Exception as e:
+                self.ib_broker.connected = False
+                raise
 
     def get_all_open_positions_pnl(self, account=None):
         """Request PnL for all open positions from IBKR. Returns list of {symbol, expiry, strike, right, unrealized_pnl, realized_pnl, ...}."""
@@ -1932,14 +1932,14 @@ class StrategyBroker:
         with self.counter_lock:
             req_id = self.get_next_available_order_id()
 
-        try:
-            order_id, fill_price = self.ib_broker.place_market_option_order(
-                symbol, exchange, expiry, strike, right, action, qty, req_id, wait_until_filled
-            )
-            return {"order_id": order_id, "fill_price": fill_price}
-        except Exception as e:
-            self.ib_broker.connected = False
-            raise
+            try:
+                order_id, fill_price = self.ib_broker.place_market_option_order(
+                    symbol, exchange, expiry, strike, right, action, qty, req_id, wait_until_filled
+                )
+                return {"order_id": order_id, "fill_price": fill_price}
+            except Exception as e:
+                self.ib_broker.connected = False
+                raise
 
         # return {
         #     "order_id": 1,
