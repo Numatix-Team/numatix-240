@@ -37,6 +37,6 @@
   },
   "DUH300582_SPX": {
     "paused": false,
-    "stopped": false
+    "stopped": true
   }
 }

@@ -72,13 +72,32 @@ def parse_args():
     return parser.parse_args()
 
 
+def _resolve_nickname_to_ibkr(nickname):
+    """Resolve account nickname to IBKR account ID from accounts.json. Returns nickname if not found (fallback)."""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(base_dir, "accounts.json")
+    if not os.path.exists(path):
+        return nickname
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        accounts = data.get("accounts") or []
+        for a in accounts:
+            if a.get("nickname") == nickname:
+                return a.get("ibkr_account_id", nickname)
+    except Exception:
+        pass
+    return nickname
+
+
 class Strategy:
 
-    def __init__(self, manager, broker, account, config_path="config.json", strike_offset=0, base_atm_price=None, symbol=None):
+    def __init__(self, manager, broker, account, config_path="config.json", strike_offset=0, base_atm_price=None, symbol=None, ibkr_account_id=None):
         self.manager = manager
         self.broker = broker
         self.config_path = config_path
-        self.account = account
+        self.account = account  # nickname: used for DB, PID, state, position rows
+        self.ibkr_account_id = ibkr_account_id if ibkr_account_id is not None else account  # for broker API only
         self.strike_offset = strike_offset  # n value: strike = ATM + n
         self.base_atm_price = base_atm_price  # Base ATM price from broker
         self.symbol_override = symbol  # Symbol passed from frontend (overrides config)
@@ -689,16 +708,10 @@ class Strategy:
                 return "P"
             return r
 
-        # If we have PnL from IBKR open positions, find matching position and use its unrealized PnL only (realized stays from DB)
-        unrealized_pnl = None
-        def _sane_pnl(v):
-            if v is None: return None
-            try:
-                x = float(v)
-                if x != x or abs(x) > 1e9: return None  # nan or absurd (IBKR sentinel)
-                return x
-            except (TypeError, ValueError):
-                return None
+        # If we have PnL from IBKR, a match tells us this position is live at the broker.
+        # We always compute unrealized PnL from *our* qty and entry_price (same contract may exist
+        # before the bot, so broker's total PnL is for full size; we use our size only).
+        match_found = False
         if pnl_list:
             pos_expiry_n = _normalize_expiry(expiry)
             pos_strike = float(strike) if strike is not None else 0
@@ -713,12 +726,11 @@ class Strategy:
                     and pos_expiry_n == row_expiry
                     and abs(pos_strike - row_strike) < 0.01
                     and pos_right_n == row_right):
-                    unrealized_pnl = _sane_pnl(row.get("unrealized_pnl"))
-                    if unrealized_pnl is not None:
-                        print(f"[UPDATE] Matched IBKR position PnL: unrealized={unrealized_pnl}")
+                    match_found = True
+                    print(f"[UPDATE] Matched IBKR position (broker qty={row.get('pos')}); will use our qty and entry_price for unrealized PnL")
                     break
 
-        # Fetch bid/ask for last_price display (and fallback PnL if no broker PnL)
+        # Fetch bid/ask for last_price (required to compute unrealized PnL from our qty and entry_price)
         try:
             data = self.broker.get_option_premium(
                 pos["symbol"], pos["expiry"], pos["strike"], pos["right"], test_mode=test_mode
@@ -727,7 +739,7 @@ class Strategy:
             print(f"[UPDATE] Broker error (will retry next cycle): {e}")
             return
 
-        if data is None and unrealized_pnl is None:
+        if data is None and not match_found:
             print(f"[UPDATE] SKIPPED: No data from IBKR and no PnL match for {pos_type} {right} @ Strike {strike}")
             return
 
@@ -737,25 +749,22 @@ class Strategy:
         if data:
             print(f"[UPDATE] Received market data: bid={bid}, ask={ask}, last={last}")
 
-        # PnL: use broker list when available (already in dollars), else compute from bid/ask and convert to dollars
-        if unrealized_pnl is not None:
-            pass  # use broker unrealized_pnl (already in dollars)
+        # Always compute unrealized PnL from our position's qty and entry_price (so pre-bot size is not included)
+        entry = pos.get("entry_price")
+        qty = pos.get("qty")
+        if entry is None or qty is None:
+            return
+        if pos["side"] == "SELL":
+            last_price = bid
         else:
-            if pos["side"] == "SELL":
-                last_price = bid
-            else:
-                last_price = ask
-            if last_price is None:
-                print(f"[UPDATE] SKIPPED: No price and no broker PnL for {pos_type} {right} @ Strike {strike}")
-                return
-            entry = pos.get("entry_price")
-            qty = pos.get("qty")
-            if entry is None or qty is None:
-                return
-            if pos["side"] == "SELL":
-                unrealized_pnl = (entry - last_price) * qty
-            else:
-                unrealized_pnl = (last_price - entry) * qty
+            last_price = ask
+        if last_price is None:
+            print(f"[UPDATE] SKIPPED: No price for {pos_type} {right} @ Strike {strike}")
+            return
+        if pos["side"] == "SELL":
+            unrealized_pnl = (entry - last_price) * qty * self.multiplier
+        else:
+            unrealized_pnl = (last_price - entry) * qty * self.multiplier
 
         # Only update unrealized PnL here; keep existing realized PnL from DB (do not overwrite from broker)
         existing_realized_pnl = pos.get("realized_pnl", 0.0) or 0.0
@@ -962,9 +971,9 @@ class Strategy:
                         last_price = bid
                         
                         if last_price is not None:
-                            # Recalculate unrealized PnL with remaining quantity (SELL side)
+                            # Recalculate unrealized PnL with remaining quantity (SELL side), with multiplier
                             old_unrealized = call_pos.get("unrealized_pnl", 0) or 0
-                            call_pos["unrealized_pnl"] = (entry - last_price) * self.curr_call_qty
+                            call_pos["unrealized_pnl"] = (entry - last_price) * self.curr_call_qty * self.multiplier
                             call_pos["last_price"] = last  # Store actual last price in database
                             call_pos["bid"] = bid
                             call_pos["ask"] = ask
@@ -1052,9 +1061,9 @@ class Strategy:
                         last_price = bid
                         
                         if last_price is not None:
-                            # Recalculate unrealized PnL with remaining quantity (SELL side)
+                            # Recalculate unrealized PnL with remaining quantity (SELL side), with multiplier
                             old_unrealized = put_pos.get("unrealized_pnl", 0) or 0
-                            put_pos["unrealized_pnl"] = (entry - last_price) * self.curr_put_qty
+                            put_pos["unrealized_pnl"] = (entry - last_price) * self.curr_put_qty * self.multiplier
                             put_pos["last_price"] = last  # Store actual last price in database
                             put_pos["bid"] = bid
                             put_pos["ask"] = ask
@@ -1143,9 +1152,9 @@ class Strategy:
                             last_price = ask
                             
                             if last_price is not None:
-                                # Recalculate unrealized PnL with remaining quantity (BUY side)
+                                # Recalculate unrealized PnL with remaining quantity (BUY side), with multiplier
                                 old_unrealized = hedge_call_pos.get("unrealized_pnl", 0) or 0
-                                hedge_call_pos["unrealized_pnl"] = (last_price - entry) * self.curr_hedge_qty
+                                hedge_call_pos["unrealized_pnl"] = (last_price - entry) * self.curr_hedge_qty * self.multiplier
                                 hedge_call_pos["last_price"] = last
                                 hedge_call_pos["bid"] = bid
                                 hedge_call_pos["ask"] = ask
@@ -1232,9 +1241,9 @@ class Strategy:
                             last_price = ask
                             
                             if last_price is not None:
-                                # Recalculate unrealized PnL with remaining quantity (BUY side)
+                                # Recalculate unrealized PnL with remaining quantity (BUY side), with multiplier
                                 old_unrealized = hedge_put_pos.get("unrealized_pnl", 0) or 0
-                                hedge_put_pos["unrealized_pnl"] = (last_price - entry) * self.curr_hedge_qty
+                                hedge_put_pos["unrealized_pnl"] = (last_price - entry) * self.curr_hedge_qty * self.multiplier
                                 hedge_put_pos["last_price"] = last
                                 hedge_put_pos["bid"] = bid
                                 hedge_put_pos["ask"] = ask
@@ -1283,7 +1292,7 @@ class Strategy:
             # Request PnL for all open positions once per cycle (IBKR), then update each leg
             pnl_list = []
             try:
-                pnl_list = self.broker.get_all_open_positions_pnl(account=self.account)
+                pnl_list = self.broker.get_all_open_positions_pnl(account=self.ibkr_account_id)
             except Exception as e:
                 print(f"[MANAGE] Could not fetch positions PnL list: {e}")
             # Update all legs (pass pnl_list so we can set PnL from IBKR when we find a match)
@@ -1499,21 +1508,20 @@ class Strategy:
 
     # CLOSE LEG
     def _close_leg(self, pos_id, resp):
+        """Close position using fill price from resp. Updates realized_pnl with (entry - fill_price) * qty * multiplier."""
         pos = get_position_by_id(pos_id, self.account, self.symbol)
         if pos is None:
             return
 
-        fill = resp.get("fill_price")
-        close_price = fill
+        close_price = resp.get("fill_price")  # Use fill price for realized PnL
         now = datetime.now(self.tz).isoformat()
 
         entry = pos["entry_price"]
         qty = pos["qty"]
-        existing_realized_pnl = pos.get("realized_pnl", 0.0) or 0.0  # Get existing realized PnL from partial exits
+        existing_realized_pnl = pos.get("realized_pnl", 0.0) or 0.0  # From partial exits (also used fill price)
 
         if entry is not None and close_price is not None:
             if pos["side"] == "SELL":
-                # Calculate realized PnL for remaining quantity: fill_price * multiplier * quantity
                 remaining_realized_pnl = (entry - close_price) * self.multiplier * qty
             else:
                 remaining_realized_pnl = (close_price - entry) * self.multiplier * qty
@@ -1624,11 +1632,11 @@ class Strategy:
         self.curr_put_qty -= partial_exit_qty
 
         # Update position in database with new quantity and PnL
-        call_pos = get_position_by_id(self.atm_call_id)
-        put_pos = get_position_by_id(self.atm_put_id)
+        call_pos = get_position_by_id(self.atm_call_id, self.account, self.symbol)
+        put_pos = get_position_by_id(self.atm_put_id, self.account, self.symbol)
         
         if call_pos:
-            # Calculate realized PnL for partial exit
+            # Calculate realized PnL for partial exit (using fill price and multiplier)
             entry = call_pos["entry_price"]
             exit_price = call_partial["fill_price"]
             partial_realized_pnl = (entry - exit_price) * self.multiplier * partial_exit_qty
@@ -1651,8 +1659,8 @@ class Strategy:
         print("\n[TEST] Updating positions after partial close...")
         self._update_live_leg(self.atm_call_id, test_mode=True)
         self._update_live_leg(self.atm_put_id, test_mode=True)
-        call_pos = get_position_by_id(self.atm_call_id)
-        put_pos = get_position_by_id(self.atm_put_id)
+        call_pos = get_position_by_id(self.atm_call_id, self.account, self.symbol)
+        put_pos = get_position_by_id(self.atm_put_id, self.account, self.symbol)
         if call_pos and put_pos:
             total_unrealized = (call_pos.get("unrealized_pnl", 0) or 0) + (put_pos.get("unrealized_pnl", 0) or 0)
             total_realized = (call_pos.get("realized_pnl", 0) or 0) + (put_pos.get("realized_pnl", 0) or 0)
@@ -1672,8 +1680,8 @@ class Strategy:
         )
 
         print(f"[TEST] Full close: {self.curr_call_qty} call contracts, {self.curr_put_qty} put contracts")
-        print(f"[TEST] Call exit price: ${call_exit['fill_price']:.2f}")
-        print(f"[TEST] Put exit price: ${put_exit['fill_price']:.2f}")
+        print(f"[TEST] Call exit price (fill): ${call_exit['fill_price']:.2f}")
+        print(f"[TEST] Put exit price (fill): ${put_exit['fill_price']:.2f}")
 
         self._close_leg(self.atm_call_id, call_exit)
         self._close_leg(self.atm_put_id, put_exit)
@@ -1685,8 +1693,8 @@ class Strategy:
         save_active_ids(False, None, None, None, None, self.account, self.symbol)
 
         # Get final positions to show final PnL
-        call_pos = get_position_by_id(self.atm_call_id)
-        put_pos = get_position_by_id(self.atm_put_id)
+        call_pos = get_position_by_id(self.atm_call_id, self.account, self.symbol)
+        put_pos = get_position_by_id(self.atm_put_id, self.account, self.symbol)
         if call_pos and put_pos:
             final_realized = (call_pos.get("realized_pnl", 0) or 0) + (put_pos.get("realized_pnl", 0) or 0)
             print(f"[TEST] Final Total Realized PnL: ${final_realized:.2f}")
@@ -1950,8 +1958,9 @@ class StrategyBroker:
 
 # STRATEGY MANAGER
 class StrategyManager:
-    def __init__(self, config_path="config.json", account="default", symbol_override=None, strike_range=None, current_atm_price=None, test_mode=False):
-        self.account = account
+    def __init__(self, config_path="config.json", account="default", symbol_override=None, strike_range=None, current_atm_price=None, test_mode=False, ibkr_account_id=None):
+        self.account = account  # nickname: DB, PID, state
+        self.ibkr_account_id = ibkr_account_id if ibkr_account_id is not None else account
         self.config_path = config_path
         self.strike_range = strike_range if strike_range is not None else [0]  # Default to [0] for backward compatibility
         self.current_atm_price = current_atm_price
@@ -1993,7 +2002,8 @@ class StrategyManager:
                 config_path=config_path,
                 strike_offset=offset,
                 base_atm_price=self.current_atm_price,
-                symbol=symbol_override  # Pass symbol from frontend to Strategy
+                symbol=symbol_override,  # Pass symbol from frontend to Strategy
+                ibkr_account_id=self.ibkr_account_id
             )
             self.strategies.append(strategy)
 
@@ -2063,8 +2073,9 @@ if __name__ == "__main__":
     
     args = parse_args()
     
-    # Write PID to file for frontend to track (account+symbol-specific)
-    account = args.account
+    # args.account is nickname; use it for DB, PID, state. Resolve to ibkr_account_id for broker.
+    account = args.account  # nickname
+    ibkr_account_id = _resolve_nickname_to_ibkr(account)
     symbol = args.symbol or "default"  # Use symbol from args or default
     pid_file = f"bot.{account}.{symbol}.pid"
     status_file = f"bot.{account}.{symbol}.status"
@@ -2099,6 +2110,16 @@ if __name__ == "__main__":
             f.write(f"running|{datetime.now().isoformat()}")
     except Exception as e:
         print(f"[Main] Warning: Could not write tracking files: {e}")
+
+    # Print full config once at startup
+    try:
+        with open(args.config, "r") as f:
+            startup_config = json.load(f)
+        print(f"[Main] Config file: {args.config}")
+        print("[Main] Full config:")
+        print(json.dumps(startup_config, indent=2))
+    except Exception as e:
+        print(f"[Main] Warning: Could not load/print config: {e}")
 
     # Parse strike range if provided (start/end can be negative, e.g. -2:3)
     # Support both ':' and '-' as separator (Windows may drop ':' in some launch scenarios)
@@ -2154,10 +2175,11 @@ if __name__ == "__main__":
     try:
         manager = StrategyManager(
             config_path=args.config,
-            account=args.account,
+            account=account,
             symbol_override=args.symbol,
             strike_range=strike_range,
-            test_mode=False
+            test_mode=False,
+            ibkr_account_id=ibkr_account_id
         )
         
         # Start a background thread to update status file periodically

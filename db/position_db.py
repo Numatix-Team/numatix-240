@@ -6,20 +6,16 @@ from typing import Optional, List, Dict
 class PositionDB:
     def __init__(self, db_path=None, account=None, symbol=None):
         """
-        Initialize PositionDB with account and symbol.
-        If account and symbol are provided, uses account+symbol specific database.
-        Otherwise uses the provided db_path (for backward compatibility).
+        Initialize PositionDB with nickname (account) and symbol.
+        Database file: positions_{account}_{symbol}.db
+        db_path is only for opening an existing file when discovering DBs (e.g. MultiAccountDB).
         """
         if account and symbol:
-            # Use account+symbol specific database
             self.db_path = f"positions_{account}_{symbol}.db"
         elif db_path:
-            # Use provided path (backward compatibility)
             self.db_path = db_path
         else:
-            # Default to old format for backward compatibility
-            self.db_path = "positions.db"
-        
+            raise ValueError("PositionDB requires (account and symbol) or db_path")
         self.account = account
         self.symbol = symbol
         self.lock = threading.Lock()
@@ -284,10 +280,10 @@ class PositionDB:
         return realized + unrealized
 
     # ---------------------------
-    # ACTIVE POSITION IDS (for backward compatibility)
+    # ACTIVE POSITION IDS
     # ---------------------------
     def get_active_position_ids(self, account: Optional[str] = None, symbol: Optional[str] = None) -> Dict:
-        """Get active position IDs in the old format for compatibility."""
+        """Get active position IDs (ATM/OTM call/put) for this DB."""
         active_positions = self.get_active_positions(account, symbol)
         
         # Find ATM and OTM positions

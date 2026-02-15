@@ -1,0 +1,54 @@
+{
+    "broker": {
+        "host": "127.0.0.1",
+        "port": 7497,
+        "client_id": 1
+    },
+    "underlying": {
+        "symbol": "SPX",
+        "exchange": "SMART",
+        "currency": "USD",
+        "trading_class": "SPXW",
+        "multiplier": 100
+    },
+    "expiry": {
+        "date": "20260213"
+    },
+    "trade_parameters": {
+        "call_quantity": 1,
+        "put_quantity": 1,
+        "entry_vwap_multiplier": 0.99,
+        "exit_vwap_multiplier": 1.02,
+        "take_profit_levels": [
+            {
+                "pnl_percent": 0.1,
+                "exit_percent": 0.5
+            },
+            {
+                "pnl_percent": 0.4,
+                "exit_percent": 0.3
+            },
+            {
+                "pnl_percent": 0.5,
+                "exit_percent": 0.2
+            }
+        ],
+        "stop_loss": 0.1,
+        "max_bid_ask_spread": 1.05,
+        "strike_step": 5
+    },
+    "time_controls": {
+        "entry_start": "09:30",
+        "entry_end": "14:30",
+        "force_exit_time": "15:10",
+        "timezone": "US/Eastern"
+    },
+    "hedging": {
+        "enable_hedges": true,
+        "hedge_call_offset": 5,
+        "hedge_put_offset": 5,
+        "hedge_quantity": 1
+    },
+    "paused": false,
+    "stopped": false
+}

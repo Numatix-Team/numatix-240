@@ -25,6 +25,14 @@ EASTERN_TZ = pytz.timezone("US/Eastern")
 
 CONFIG_PATH = "config.json"
 POSITIONS_PATH = "positions.json"
+
+
+def get_config_path_for_nickname(nickname):
+    """Return config file path for a profile: config_{nickname}.json (safe filename)."""
+    safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in (nickname or "default"))
+    return f"config_{safe}.json"
+
+
 # Account+symbol-specific PID/status file paths
 def get_pid_path(account, symbol=None):
     if symbol:
@@ -61,16 +69,10 @@ def get_all_running_accounts():
     base_dir = os.path.dirname(os.path.abspath(__file__))
     for filename in os.listdir(base_dir):
         if filename.startswith("bot.") and filename.endswith(".pid"):
-            # Extract account and symbol from "bot.{account}.{symbol}.pid" or "bot.{account}.pid"
-            parts = filename[4:-4].split(".")  # Remove "bot." prefix and ".pid" suffix, then split
-            if len(parts) == 1:
-                # Old format: bot.account.pid (backward compatibility)
-                account = parts[0]
-                symbol = None
-            else:
-                # New format: bot.account.symbol.pid
-                account = parts[0]
-                symbol = parts[1]
+            # Extract account (nickname) and symbol from bot.{account}.{symbol}.pid
+            parts = filename[4:-4].split(".")  # Remove "bot." prefix and ".pid" suffix
+            account = parts[0]
+            symbol = parts[1] if len(parts) > 1 else None
             
             pid = load_pid(account, symbol)
             if pid and pid_running(pid, account, symbol):
@@ -201,9 +203,36 @@ def save_json(path, data):
 def edit_config_page():
     st.header("Configuration Editor")
 
-    config = load_json(CONFIG_PATH)
+    accounts = load_accounts()
+    account_nicknames = [a["nickname"] for a in accounts] if accounts else ["default"]
+    selected_nickname = st.selectbox(
+        "Profile (Account)",
+        account_nicknames,
+        index=0,
+        help="Configuration is stored in config_{nickname}.json for this profile.",
+        key="config_editor_profile"
+    )
+    config_path = get_config_path_for_nickname(selected_nickname)
+
+    if not os.path.exists(config_path):
+        st.info(f"**{config_path}** not found. Create it manually, or initialize from the default config below.")
+        if os.path.exists(CONFIG_PATH) and st.button("Initialize from config.json", key="init_config_from_default"):
+            try:
+                with open(CONFIG_PATH, "r") as f:
+                    default_config = json.load(f)
+                with open(config_path, "w") as f:
+                    json.dump(default_config, f, indent=4)
+                st.success(f"Created {config_path} from config.json. You can edit and save below.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Failed to create config: {e}")
+        return
+
+    config = load_json(config_path)
     if config is None:
         return
+
+    st.caption(f"Editing: **{config_path}**")
 
     # -------------------------
     # Broker Section
@@ -387,7 +416,7 @@ def edit_config_page():
 
 
     if st.button("Save Configuration"):
-        save_json(CONFIG_PATH, config)
+        save_json(config_path, config)
 
 
 
@@ -398,17 +427,16 @@ def positions_page():
     st.header("Positions Dashboard")
 
     accounts = load_accounts()
-    id_to_nickname = {a["ibkr_account_id"]: a["nickname"] for a in accounts} if accounts else {}
-    account_options = [None] + [a["ibkr_account_id"] for a in accounts] if accounts else [None]
+    account_options = [None] + [a["nickname"] for a in accounts] if accounts else [None]
 
-    # Get filters
+    # Get filters (account = nickname; DB is keyed by nickname)
     col1, col2 = st.columns(2)
     
     with col1:
         account = st.selectbox(
             "Filter by Account",
             account_options,
-            format_func=lambda x: "All Accounts" if x is None else id_to_nickname.get(x, x),
+            format_func=lambda x: "All Accounts" if x is None else x,
             index=0
         )
     
@@ -687,8 +715,7 @@ def historical_data_page():
     st.subheader("Filters")
     
     accounts = load_accounts()
-    id_to_nickname = {a["ibkr_account_id"]: a["nickname"] for a in accounts} if accounts else {}
-    account_options = [None] + [a["ibkr_account_id"] for a in accounts] if accounts else [None]
+    account_options = [None] + [a["nickname"] for a in accounts] if accounts else [None]
 
     col1, col2 = st.columns(2)
     
@@ -696,7 +723,7 @@ def historical_data_page():
         account = st.selectbox(
             "Filter by Account",
             account_options,
-            format_func=lambda x: "All Accounts" if x is None else id_to_nickname.get(x, x),
+            format_func=lambda x: "All Accounts" if x is None else x,
             index=0,
             key="hist_account"
         )
@@ -895,8 +922,6 @@ def main():
     st.subheader("Run Configuration")
 
     accounts = load_accounts()
-    # Use nickname as option so dropdown shows Vedanhs, acc2, acc3; resolve to ibkr_account_id when starting
-    nickname_to_ibkr = {a["nickname"]: a["ibkr_account_id"] for a in accounts} if accounts else {}
     account_nicknames = [a["nickname"] for a in accounts] if accounts else ["default"]
 
     col1, col2 = st.columns(2)
@@ -907,8 +932,8 @@ def main():
             account_nicknames,
             index=0
         )
-        # Resolve to ibkr_account_id for PID/state/main (used below when starting)
-        account = nickname_to_ibkr.get(selected_nickname, selected_nickname)
+        # Use nickname for PID, state, DB, and --account (main.py resolves to ibkr_account_id for broker)
+        account = selected_nickname
 
     with col2:
         symbol = st.selectbox(
@@ -980,29 +1005,33 @@ def main():
                     set_account_paused(account, False, symbol)
                     set_account_stopped(account, False, symbol)
                     
-                    # Build command: use --key=value so negative ranges (e.g. -4-10) aren't parsed as separate options
-                    cmd_args = [python_path, main_path, '--account', account, '--symbol', symbol, f'--range={strike_range_arg}']
-                    if exclude_offsets and exclude_offsets.strip():
-                        cmd_args.append(f'--exclude={exclude_offsets.strip()}')
-                    
-                    if os.name == 'nt':  # Windows
-                        # Use CREATE_NEW_CONSOLE to open in new window
-                        # Note: The PID will be written by main.py itself when it starts
-                        p = subprocess.Popen(
-                            cmd_args,
-                            cwd=base_dir,
-                            creationflags=subprocess.CREATE_NEW_CONSOLE
-                        )
-                        # Save the PID (main.py will also write it, but this is a backup)
-                        save_pid(p.pid, account, symbol)
+                    # Build command: use profile-specific config config_{nickname}.json
+                    profile_config_path = get_config_path_for_nickname(selected_nickname)
+                    if not os.path.exists(profile_config_path):
+                        st.error(f"Config for this profile not found: {profile_config_path}. Create it manually or use Config Editor to initialize from default.")
                     else:
-                        p = subprocess.Popen(cmd_args, cwd=base_dir)
-                        save_pid(p.pid, account, symbol)
-                    
-                    range_display = strike_range_str + (f" (exclude: {exclude_offsets.strip()})" if exclude_offsets and exclude_offsets.strip() else "")
-                    st.success(f"Started {selected_nickname} | {symbol} | Range: {range_display}")
-                    time.sleep(1)  # Give it a moment to start
-                    st.rerun()
+                        cmd_args = [python_path, main_path, '--account', selected_nickname, '--symbol', symbol, '--config', profile_config_path, f'--range={strike_range_arg}']
+                        if exclude_offsets and exclude_offsets.strip():
+                            cmd_args.append(f'--exclude={exclude_offsets.strip()}')
+                        
+                        if os.name == 'nt':  # Windows
+                            # Use CREATE_NEW_CONSOLE to open in new window
+                            # Note: The PID will be written by main.py itself when it starts
+                            p = subprocess.Popen(
+                                cmd_args,
+                                cwd=base_dir,
+                                creationflags=subprocess.CREATE_NEW_CONSOLE
+                            )
+                            # Save the PID (main.py will also write it, but this is a backup)
+                            save_pid(p.pid, account, symbol)
+                        else:
+                            p = subprocess.Popen(cmd_args, cwd=base_dir)
+                            save_pid(p.pid, account, symbol)
+                        
+                        range_display = strike_range_str + (f" (exclude: {exclude_offsets.strip()})" if exclude_offsets and exclude_offsets.strip() else "")
+                        st.success(f"Started {selected_nickname} | {symbol} | Range: {range_display}")
+                        time.sleep(1)  # Give it a moment to start
+                        st.rerun()
                 except Exception as e:
                     st.error(f"Error: {e}")
     

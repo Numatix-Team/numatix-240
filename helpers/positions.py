@@ -17,16 +17,12 @@ _db_cache = {}
 _db_lock = threading.Lock()
 
 def get_db(account, symbol):
-    """Get or create database instance for account+symbol combination."""
+    """Get or create database instance for account (nickname) and symbol. File: positions_{account}_{symbol}.db"""
     key = f"{account}_{symbol}"
-    
     with _db_lock:
         if key not in _db_cache:
             _db_cache[key] = PositionDB(account=account, symbol=symbol)
         return _db_cache[key]
-
-# For backward compatibility - will be replaced when account/symbol are known
-_db = None
 
 
 # =========================================================
@@ -115,29 +111,11 @@ def create_position_entry(
 
 
 def get_position_by_id(pos_id, account=None, symbol=None):
-    """Get position by ID. If account and symbol are provided, uses specific DB, otherwise searches all."""
-    if pos_id is None:
+    """Get position by ID from the database for the given account (nickname) and symbol."""
+    if pos_id is None or not account or not symbol:
         return None
-    
-    # If account and symbol are known, use specific database
-    if account and symbol:
-        db = get_db(account, symbol)
-        return db.get_position(pos_id)
-    
-    # Otherwise, search across all databases (for backward compatibility)
-    # This is less efficient but maintains compatibility
-    import glob
-    import os
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    pattern = os.path.join(base_dir, "positions_*.db")
-    
-    for db_file in glob.glob(pattern):
-        db = PositionDB(db_path=db_file)
-        pos = db.get_position(pos_id)
-        if pos:
-            return pos
-    
-    return None
+    db = get_db(account, symbol)
+    return db.get_position(pos_id)
 
 
 def simulated_bid_ask(base_price):
@@ -152,42 +130,17 @@ def simulated_bid_ask(base_price):
 # =========================================================
 
 def load_active_ids(account=None, symbol=None):
-    """Load active position IDs. Uses database active field."""
-    if account and symbol:
-        db = get_db(account, symbol)
-        return db.get_active_position_ids(account=None, symbol=None)  # No filter needed, DB is already filtered
-    else:
-        # For backward compatibility, search all databases
-        from db.multi_account_db import MultiAccountDB
-        multi_db = MultiAccountDB()
-        active_positions = multi_db.get_active_positions(account, symbol)
-        
-        # Build active IDs dict
-        atm_call_id = None
-        atm_put_id = None
-        otm_call_id = None
-        otm_put_id = None
-        
-        for pos in active_positions:
-            pos_type = pos.get("position_type", "")
-            if pos_type == "ATM":
-                if pos.get("right") == "C":
-                    atm_call_id = pos["id"]
-                elif pos.get("right") == "P":
-                    atm_put_id = pos["id"]
-            elif pos_type == "OTM":
-                if pos.get("right") == "C":
-                    otm_call_id = pos["id"]
-                elif pos.get("right") == "P":
-                    otm_put_id = pos["id"]
-        
+    """Load active position IDs from the database for the given account (nickname) and symbol."""
+    if not account or not symbol:
         return {
-            "position_open": len(active_positions) > 0,
-            "atm_call_id": atm_call_id,
-            "atm_put_id": atm_put_id,
-            "otm_call_id": otm_call_id,
-            "otm_put_id": otm_put_id
+            "position_open": False,
+            "atm_call_id": None,
+            "atm_put_id": None,
+            "otm_call_id": None,
+            "otm_put_id": None,
         }
+    db = get_db(account, symbol)
+    return db.get_active_position_ids(account=None, symbol=None)
 
 
 def save_active_ids(position_open, atm_call_id, atm_put_id, otm_call_id, otm_put_id, account=None, symbol=None):
@@ -243,45 +196,23 @@ def update_position_in_db(updated_pos):
     right = updated_pos.get("right", "")
     strike = updated_pos.get("strike", 0)
     
-    if account and symbol:
-        # Use account+symbol specific database
-        db = get_db(account, symbol)
-        existing = db.get_position(pos_id)
-        if existing:
-            # Show what's being updated
-            last_price = updated_pos.get("last_price")
-            unrealized = updated_pos.get("unrealized_pnl", 0) or 0
-            realized = updated_pos.get("realized_pnl", 0) or 0
-            qty = updated_pos.get("qty", 0)
-            last_price_str = f"${last_price:.2f}" if last_price is not None else "N/A"
-            print(f"[DB] Updating {pos_type} {right} @ Strike {strike} in {account}/{symbol} DB:")
-            print(f"[DB]   Last Price: {last_price_str}, Qty: {qty}")
-            print(f"[DB]   Realized PnL: ${realized:.2f}, Unrealized PnL: ${unrealized:.2f}")
-            db.update_position(pos_id, updated_pos)
-            print(f"[DB] Update complete")
-        else:
-            print(f"[DB] Inserting new {pos_type} {right} @ Strike {strike} in {account}/{symbol} DB")
-            db.insert_position(updated_pos)
-            print(f"[DB] Insert complete")
+    if not account or not symbol:
+        return
+    db = get_db(account, symbol)
+    existing = db.get_position(pos_id)
+    if existing:
+        last_price = updated_pos.get("last_price")
+        unrealized = updated_pos.get("unrealized_pnl", 0) or 0
+        realized = updated_pos.get("realized_pnl", 0) or 0
+        qty = updated_pos.get("qty", 0)
+        last_price_str = f"${last_price:.2f}" if last_price is not None else "N/A"
+        print(f"[DB] Updating {pos_type} {right} @ Strike {strike} in {account}/{symbol} DB:")
+        print(f"[DB]   Last Price: {last_price_str}, Qty: {qty}")
+        print(f"[DB]   Realized PnL: ${realized:.2f}, Unrealized PnL: ${unrealized:.2f}")
+        db.update_position(pos_id, updated_pos)
+        print(f"[DB] Update complete")
     else:
-        # Fallback: search all databases (less efficient)
-        import glob
-        import os
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        pattern = os.path.join(base_dir, "positions_*.db")
-        
-        found = False
-        for db_file in glob.glob(pattern):
-            db = PositionDB(db_path=db_file)
-            existing = db.get_position(pos_id)
-            if existing:
-                db.update_position(pos_id, updated_pos)
-                found = True
-                break
-        
-        if not found:
-            # If not found and we have account/symbol, create in the right DB
-            if account and symbol:
-                db = get_db(account, symbol)
-                db.insert_position(updated_pos)
+        print(f"[DB] Inserting new {pos_type} {right} @ Strike {strike} in {account}/{symbol} DB")
+        db.insert_position(updated_pos)
+        print(f"[DB] Insert complete")
 
