@@ -1,4 +1,4 @@
-from main import StrategyBroker
+from broker.strategy_broker import StrategyBroker
 
 
 a=StrategyBroker()
