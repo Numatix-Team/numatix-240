@@ -350,14 +350,26 @@ def edit_config_page():
                 key=f"tp_exit_{i}"
             )
 
-    st.markdown("### Stop Loss")
+    st.markdown("### Stop Loss, Drawdown & Profit Limit")
     col1, col2, col3 = st.columns(3)
     with col1:
         tp["stop_loss"] = st.number_input("Stop Loss (%)", value=tp["stop_loss"])
     with col2:
-        st.write("")
+        tp["drawdown_limit"] = st.number_input(
+            "Drawdown Limit ($)",
+            value=int(tp.get("drawdown_limit", 5000)),
+            min_value=0,
+            step=500,
+            help="Exit all and stop when total PnL is at or below this loss. Checked every 30s."
+        )
     with col3:
-        st.write("")
+        tp["profit_limit"] = st.number_input(
+            "Profit Limit ($)",
+            value=int(tp.get("profit_limit", 5000)),
+            min_value=0,
+            step=500,
+            help="Exit all and stop when total PnL reaches or exceeds this profit. Checked every 30s."
+        )
 
     st.markdown("---")
 

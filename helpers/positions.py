@@ -161,8 +161,13 @@ def save_active_ids(position_open, atm_call_id, atm_put_id, otm_call_id, otm_put
         if pos_id:
             pos = get_position_by_id(pos_id, account, symbol)
             if pos:
+                # IBKR reports SELL/short as negative; treat as active if |qty| > 0
                 qty = pos.get("qty", 0)
-                should_be_active = (qty > 0)
+                try:
+                    qty_magnitude = abs(int(float(qty)))
+                except (TypeError, ValueError):
+                    qty_magnitude = 0
+                should_be_active = (qty_magnitude > 0)
                 current_active = pos.get("active", False)
                 # Only update if it's incorrect
                 if current_active != should_be_active:

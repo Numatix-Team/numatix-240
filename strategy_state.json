@@ -38,5 +38,9 @@
   "DUH300582_SPX": {
     "paused": false,
     "stopped": true
+  },
+  "Vedansh_SPX": {
+    "paused": false,
+    "stopped": false
   }
 }

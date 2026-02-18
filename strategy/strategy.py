@@ -23,6 +23,16 @@ from helpers.positions import (
     load_active_ids,
 )
 
+def _position_qty(q):
+    """Normalize position quantity: IBKR reports SELL/short as negative (e.g. -1). Return positive magnitude."""
+    if q is None:
+        return 0
+    try:
+        return abs(int(float(q)))
+    except (TypeError, ValueError):
+        return 0
+
+
 class Strategy:
 
     def __init__(self, manager, broker, account, config_path="config.json", strike_offset=0, base_atm_price=None, symbol=None, ibkr_account_id=None):
@@ -197,30 +207,30 @@ class Strategy:
                 "otm_put_id": self.otm_put_id
             }
             
-            # Restore quantities from database positions
+            # Restore quantities from database positions (IBKR stores SELL as negative; we use magnitude)
             if self.atm_call_id:
                 call_pos = get_position_by_id(self.atm_call_id, self.account, self.symbol)
                 if call_pos:
-                    self.curr_call_qty = call_pos.get("qty", 0)
+                    self.curr_call_qty = _position_qty(call_pos.get("qty", 0))
                     self.init_call_qty = self.curr_call_qty  # Use current as initial if restoring
             
             if self.atm_put_id:
                 put_pos = get_position_by_id(self.atm_put_id, self.account, self.symbol)
                 if put_pos:
-                    self.curr_put_qty = put_pos.get("qty", 0)
+                    self.curr_put_qty = _position_qty(put_pos.get("qty", 0))
                     self.init_put_qty = self.curr_put_qty  # Use current as initial if restoring
             
             if self.enable_hedges:
                 if self.otm_call_id:
                     hedge_call_pos = get_position_by_id(self.otm_call_id, self.account, self.symbol)
                     if hedge_call_pos:
-                        self.curr_hedge_qty = hedge_call_pos.get("qty", 0)
+                        self.curr_hedge_qty = _position_qty(hedge_call_pos.get("qty", 0))
                         self.init_hedge_qty = self.curr_hedge_qty  # Use current as initial if restoring
                 elif self.otm_put_id:
                     # If only one hedge exists, use its quantity
                     hedge_put_pos = get_position_by_id(self.otm_put_id, self.account, self.symbol)
                     if hedge_put_pos:
-                        self.curr_hedge_qty = hedge_put_pos.get("qty", 0)
+                        self.curr_hedge_qty = _position_qty(hedge_put_pos.get("qty", 0))
                         self.init_hedge_qty = self.curr_hedge_qty
             
             print(f"[LOAD] Active positions loaded: ATM_C={atm_call_id}, ATM_P={atm_put_id}, OTM_C={otm_call_id}, OTM_P={otm_put_id}")
@@ -612,7 +622,7 @@ class Strategy:
             print(f"[UPDATE] Position {pos_id} not found in database")
             return
 
-        qty = pos.get("qty", 0)
+        qty = _position_qty(pos.get("qty", 0))
         if qty <= 0:
             print(f"[UPDATE] Position {pos_id} has quantity 0, skipping update")
             return
@@ -645,23 +655,34 @@ class Strategy:
         # We always compute unrealized PnL from *our* qty and entry_price (same contract may exist
         # before the bot, so broker's total PnL is for full size; we use our size only).
         match_found = False
+        pos_expiry_n = _normalize_expiry(expiry)
+        pos_strike = float(strike) if strike is not None else 0
+        pos_symbol_n = _normalize_symbol(symbol)
+        pos_right_n = _normalize_right(right)
+        qty_mismatch_reason = None  # e.g. "our qty=1, broker qty=4"
         if pnl_list:
-            pos_expiry_n = _normalize_expiry(expiry)
-            pos_strike = float(strike) if strike is not None else 0
-            pos_symbol_n = _normalize_symbol(symbol)
-            pos_right_n = _normalize_right(right)
             for row in pnl_list:
                 row_expiry = _normalize_expiry(row.get("expiry"))
                 row_strike = float(row.get("strike", 0))
                 row_symbol = _normalize_symbol(row.get("symbol"))
                 row_right = _normalize_right(row.get("right"))
-                if (pos_symbol_n == row_symbol
-                    and pos_expiry_n == row_expiry
-                    and abs(pos_strike - row_strike) < 0.01
-                    and pos_right_n == row_right):
+                broker_qty = _position_qty(row.get("pos"))  # IBKR: SELL = negative, BUY = positive; we compare magnitude
+                contract_match = (pos_symbol_n == row_symbol and pos_expiry_n == row_expiry
+                    and abs(pos_strike - row_strike) < 0.01 and pos_right_n == row_right)
+                if contract_match and broker_qty == qty:
                     match_found = True
-                    print(f"[UPDATE] Matched IBKR position (broker qty={row.get('pos')}); will use our qty and entry_price for unrealized PnL")
+                    print(f"[UPDATE] *** MATCH FOUND *** IBKR position matched (broker pos raw={row.get('pos')} -> qty magnitude={broker_qty}, our qty={qty}); using our qty and entry_price for unrealized PnL")
                     break
+                if contract_match and broker_qty != qty:
+                    qty_mismatch_reason = f"our qty={qty}, broker qty={broker_qty} (raw pos={row.get('pos')})"
+        if match_found:
+            print(f"[UPDATE] IBKR match: YES (symbol={pos_symbol_n}, expiry={pos_expiry_n}, strike={pos_strike}, right={pos_right_n})")
+        else:
+            msg = f"[UPDATE] IBKR match: NO. Our position: symbol={pos_symbol_n}, expiry={pos_expiry_n}, strike={pos_strike}, right={pos_right_n}, qty={qty}"
+            if qty_mismatch_reason:
+                msg += f". Quantity mismatch: {qty_mismatch_reason}"
+            msg += (f". (pnl_list has {len(pnl_list)} rows)" if pnl_list else ". (no pnl_list)")
+            print(msg)
 
         # Fetch bid/ask for last_price (required to compute unrealized PnL from our qty and entry_price)
         try:
@@ -682,25 +703,34 @@ class Strategy:
         if data:
             print(f"[UPDATE] Received market data: bid={bid}, ask={ask}, last={last}")
 
-        # Always compute unrealized PnL from our position's qty and entry_price (so pre-bot size is not included)
+        # Unrealized PnL: we use qty as positive magnitude in all cases.
+        # Straddle legs (call/put) = SELL → IBKR reports position as negative; we store and use positive qty.
+        # Hedges = BUY → IBKR reports positive; we also store positive. _position_qty() normalizes so qty is always > 0.
         entry = pos.get("entry_price")
-        qty = pos.get("qty")
-        if entry is None or qty is None:
+        qty = _position_qty(pos.get("qty"))
+        if entry is None or qty == 0:
             return
         if pos["side"] == "SELL":
-            last_price = bid
+            last_price = bid   # mark-to-market for short = bid
         else:
-            last_price = ask
+            last_price = ask   # mark-to-market for long = ask
         if last_price is None:
             print(f"[UPDATE] SKIPPED: No price for {pos_type} {right} @ Strike {strike}")
             return
         if pos["side"] == "SELL":
-            unrealized_pnl = (entry - last_price) * qty * self.multiplier
+            unrealized_pnl = (entry - last_price) * qty * self.multiplier  # short: profit when price falls
         else:
-            unrealized_pnl = (last_price - entry) * qty * self.multiplier
+            unrealized_pnl = (last_price - entry) * qty * self.multiplier  # long: profit when price rises
 
-        # Only update unrealized PnL here; keep existing realized PnL from DB (do not overwrite from broker)
+        print(f"[UPDATE] --- Unrealized PnL inputs --- side={pos['side']}, entry_price={entry}, qty (magnitude)={qty}, last_price={last_price}, multiplier={self.multiplier}")
+        if pos["side"] == "SELL":
+            print(f"[UPDATE] --- Unrealized PnL formula (SELL) --- (entry - last_price) * qty * mult = ({entry} - {last_price}) * {qty} * {self.multiplier} = ${unrealized_pnl:.2f}")
+        else:
+            print(f"[UPDATE] --- Unrealized PnL formula (BUY) --- (last_price - entry) * qty * mult = ({last_price} - {entry}) * {qty} * {self.multiplier} = ${unrealized_pnl:.2f}")
+
+        # Realized PnL: not recalculated here; we keep the value already in DB (from TP/close exits).
         existing_realized_pnl = pos.get("realized_pnl", 0.0) or 0.0
+        print(f"[UPDATE] --- Realized PnL --- value=${existing_realized_pnl:.2f} (from DB; computed on partial/full exit, not here)")
 
         pos["bid"] = bid
         pos["ask"] = ask
@@ -708,11 +738,7 @@ class Strategy:
         pos["unrealized_pnl"] = unrealized_pnl
         pos["realized_pnl"] = existing_realized_pnl
         pos["last_update"] = datetime.now(self.tz).isoformat()
-        
-        # Update active flag based on quantity (always True here since we skip if qty <= 0)
         pos["active"] = True
-        
-        # Clear exit_time if it was set (position is active)
         if pos.get("exit_time"):
             pos["exit_time"] = None
 
@@ -739,23 +765,20 @@ class Strategy:
         if self.atm_call_id:
             call_pos = get_position_by_id(self.atm_call_id, self.account, self.symbol)
             if call_pos:
-                call_available_qty = call_pos.get("qty", 0)
-        
+                call_available_qty = _position_qty(call_pos.get("qty", 0))  # IBKR SELL = negative
         if self.atm_put_id:
             put_pos = get_position_by_id(self.atm_put_id, self.account, self.symbol)
             if put_pos:
-                put_available_qty = put_pos.get("qty", 0)
-        
+                put_available_qty = _position_qty(put_pos.get("qty", 0))
         if self.enable_hedges:
             if self.otm_call_id:
                 hedge_call_pos = get_position_by_id(self.otm_call_id, self.account, self.symbol)
                 if hedge_call_pos:
-                    hedge_call_available_qty = hedge_call_pos.get("qty", 0)
-            
+                    hedge_call_available_qty = _position_qty(hedge_call_pos.get("qty", 0))
             if self.otm_put_id:
                 hedge_put_pos = get_position_by_id(self.otm_put_id, self.account, self.symbol)
                 if hedge_put_pos:
-                    hedge_put_available_qty = hedge_put_pos.get("qty", 0)
+                    hedge_put_available_qty = _position_qty(hedge_put_pos.get("qty", 0))
 
         # Calculate exit qty from ORIGINAL qty
         call_exit_qty = int(math.ceil(self.init_call_qty * exit_fraction))
@@ -836,7 +859,7 @@ class Strategy:
             if call_pos:
                 entry = call_pos.get("entry_price")
                 exit_price = call_resp.get("fill_price") if call_resp else None
-                old_qty = call_pos.get("qty", 0)
+                old_qty = _position_qty(call_pos.get("qty", 0))
                 old_realized = call_pos.get("realized_pnl", 0) or 0
                 
                 print(f"[TP] CALL Position Update:")
@@ -926,7 +949,7 @@ class Strategy:
             if put_pos:
                 entry = put_pos.get("entry_price")
                 exit_price = put_resp.get("fill_price") if put_resp else None
-                old_qty = put_pos.get("qty", 0)
+                old_qty = _position_qty(put_pos.get("qty", 0))
                 old_realized = put_pos.get("realized_pnl", 0) or 0
                 
                 print(f"[TP] PUT Position Update:")
@@ -1018,7 +1041,7 @@ class Strategy:
                 if hedge_call_pos:
                     entry = hedge_call_pos.get("entry_price")
                     exit_price = hedge_call_resp.get("fill_price") if hedge_call_resp else None
-                    old_qty = hedge_call_pos.get("qty", 0)
+                    old_qty = _position_qty(hedge_call_pos.get("qty", 0))
                     old_realized = hedge_call_pos.get("realized_pnl", 0) or 0
                     
                     print(f"[TP] HEDGE CALL Position Update:")
@@ -1107,7 +1130,7 @@ class Strategy:
                 if hedge_put_pos:
                     entry = hedge_put_pos.get("entry_price")
                     exit_price = hedge_put_resp.get("fill_price") if hedge_put_resp else None
-                    old_qty = hedge_put_pos.get("qty", 0)
+                    old_qty = _position_qty(hedge_put_pos.get("qty", 0))
                     old_realized = hedge_put_pos.get("realized_pnl", 0) or 0
                     
                     print(f"[TP] HEDGE PUT Position Update:")
@@ -1222,12 +1245,8 @@ class Strategy:
                 print("[MANAGE] No position open → return")
                 return None
 
-            # Request PnL for all open positions once per cycle (IBKR), then update each leg
-            pnl_list = []
-            try:
-                pnl_list = self.broker.get_all_open_positions_pnl(account=self.ibkr_account_id)
-            except Exception as e:
-                print(f"[MANAGE] Could not fetch positions PnL list: {e}")
+            # Use shared PnL list (updated every 10s by broker background thread); no per-thread fetch
+            pnl_list = self.broker.get_cached_pnl_list()
             # Update all legs (pass pnl_list so we can set PnL from IBKR when we find a match)
             print(f"[MANAGE] Updating all position legs...")
             if self.atm_call_id:
@@ -1264,34 +1283,32 @@ class Strategy:
             buy_paid = 0
             
             if ac.get("side") == "SELL":
-                sell_received += ac["entry_price"] * ac.get("qty", 0)
+                sell_received += ac["entry_price"] * _position_qty(ac.get("qty", 0))
             else:
-                buy_paid += ac["entry_price"] * ac.get("qty", 0)
-            
+                buy_paid += ac["entry_price"] * _position_qty(ac.get("qty", 0))
             if ap.get("side") == "SELL":
-                sell_received += ap["entry_price"] * ap.get("qty", 0)
+                sell_received += ap["entry_price"] * _position_qty(ap.get("qty", 0))
             else:
-                buy_paid += ap["entry_price"] * ap.get("qty", 0)
+                buy_paid += ap["entry_price"] * _position_qty(ap.get("qty", 0))
 
             # Include hedges if enabled
             if self.enable_hedges:
                 hc = get_position_by_id(self.otm_call_id, self.account, self.symbol) if self.otm_call_id else None
                 hp = get_position_by_id(self.otm_put_id, self.account, self.symbol) if self.otm_put_id else None
-                
                 if hc:
                     unrealized_pnl_total += (hc.get("unrealized_pnl", 0) or 0)
                     if hc.get("side") == "SELL":
-                        sell_received += hc["entry_price"] * hc.get("qty", 0)
+                        sell_received += hc["entry_price"] * _position_qty(hc.get("qty", 0))
                     else:
-                        buy_paid += hc["entry_price"] * hc.get("qty", 0)
+                        buy_paid += hc["entry_price"] * _position_qty(hc.get("qty", 0))
                     print(f"[MANAGE] Including hedge call: Entry=${hc['entry_price']:.2f}, Unrealized=${hc.get('unrealized_pnl', 0) or 0:.2f}")
                 
                 if hp:
                     unrealized_pnl_total += (hp.get("unrealized_pnl", 0) or 0)
                     if hp.get("side") == "SELL":
-                        sell_received += hp["entry_price"] * hp.get("qty", 0)
+                        sell_received += hp["entry_price"] * _position_qty(hp.get("qty", 0))
                     else:
-                        buy_paid += hp["entry_price"] * hp.get("qty", 0)
+                        buy_paid += hp["entry_price"] * _position_qty(hp.get("qty", 0))
                     print(f"[MANAGE] Including hedge put: Entry=${hp['entry_price']:.2f}, Unrealized=${hp.get('unrealized_pnl', 0) or 0:.2f}")
 
             # Net entry in dollars = total capital at risk (unrealized_pnl_total is stored in dollars)
@@ -1493,6 +1510,16 @@ class Strategy:
                 print(f"[Strategy-{self.strike_offset}] Paused - waiting...")
                 time_mod.sleep(5)
                 continue
+            if self.manager.drawdown_triggered:
+                print(f"[Strategy-{self.strike_offset}] Drawdown limit triggered - exiting position and stopping.")
+                if self.position_open:
+                    self.exit_position("DRAWDOWN LIMIT")
+                break
+            if self.manager.profit_limit_triggered:
+                print(f"[Strategy-{self.strike_offset}] Profit limit triggered - exiting position and stopping.")
+                if self.position_open:
+                    self.exit_position("PROFIT LIMIT")
+                break
 
             try:
                 # If a position is open → manage it (PnL updates; broker may block in ensure_connected if disconnected)

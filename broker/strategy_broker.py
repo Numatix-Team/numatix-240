@@ -3,7 +3,7 @@ import random
 import threading
 import time
 import pandas as pd
-from ib_broker import IBBroker
+from .ib_broker import IBBroker
 
 
 class StrategyBroker:
@@ -14,12 +14,19 @@ class StrategyBroker:
     Handles disconnect/reconnect: blocks until connected, retries every 30s on connection loss.
     """
     RECONNECT_INTERVAL = 30
+    PNL_CACHE_INTERVAL = 10  # seconds between global PnL list refreshes
 
     def __init__(self, config_path="config.json", test_mode=False):
         with open(config_path, "r") as f:
             self.config = json.load(f)
         self.test_mode = test_mode
         self._broker_lock = threading.Lock()
+        # Shared PnL list: one background thread updates for all strategy threads
+        self._pnl_cache = []
+        self._pnl_cache_lock = threading.Lock()
+        self._pnl_cache_account = None
+        self._pnl_updater_stop = threading.Event()
+        self._pnl_updater_thread = None
         # Skip IBKR connection in test mode
         if not test_mode:
             self._host = self.config["broker"]["host"]
@@ -136,6 +143,44 @@ class StrategyBroker:
         except Exception as e:
             self.ib_broker.connected = False
             raise
+
+    def start_pnl_cache_updater(self, account):
+        """Start a single background thread that refreshes the shared PnL list every PNL_CACHE_INTERVAL seconds.
+        All strategy threads should use get_cached_pnl_list() instead of calling get_all_open_positions_pnl."""
+        if self.test_mode or self.ib_broker is None:
+            return
+        self._pnl_cache_account = account
+        # One immediate fetch so cache is populated right away
+        try:
+            with self._pnl_cache_lock:
+                self._pnl_cache = list(self.get_all_open_positions_pnl(account=account))
+            print(f"[StrategyBroker] PnL cache initial fetch: {len(self._pnl_cache)} positions")
+        except Exception as e:
+            print(f"[StrategyBroker] PnL cache initial fetch failed: {e}")
+        if self._pnl_updater_thread is not None and self._pnl_updater_thread.is_alive():
+            return
+        self._pnl_updater_stop.clear()
+
+        def _updater():
+            while not self._pnl_updater_stop.wait(timeout=self.PNL_CACHE_INTERVAL):
+                try:
+                    fresh = self.get_all_open_positions_pnl(account=self._pnl_cache_account)
+                    print(f"[StrategyBroker] PnL cache refreshed: {len(fresh)} positions: {fresh}")
+                    with self._pnl_cache_lock:
+                        self._pnl_cache = list(fresh)
+                except Exception as e:
+                    print(f"[StrategyBroker] PnL cache refresh failed: {e}")
+
+        self._pnl_updater_thread = threading.Thread(target=_updater, name="PnLCacheUpdater", daemon=True)
+        self._pnl_updater_thread.start()
+        print(f"[StrategyBroker] PnL cache updater started (every {self.PNL_CACHE_INTERVAL}s)")
+
+    def get_cached_pnl_list(self):
+        """Return a snapshot of the shared PnL list (used by all strategy threads). Updated every PNL_CACHE_INTERVAL by background thread."""
+        if self.test_mode:
+            return []
+        with self._pnl_cache_lock:
+            return list(self._pnl_cache)
 
     def place_option_market_order(self, symbol, expiry, strike, right, qty, action, exchange, wait_until_filled=False, test_mode=False):
         print(f"[BROKER] MARKET ORDER → {action} {qty}x {symbol} {expiry} {strike}{right}")

@@ -9,6 +9,7 @@ from broker.strategy_broker import StrategyBroker
 from strategy.strategy import Strategy
 from log import setup_logger
 from helpers.state_manager import is_account_paused, is_account_stopped, set_account_stopped
+from helpers.positions import get_db
 
 setup_logger()
 
@@ -91,6 +92,12 @@ class StrategyManager:
             cfg = json.load(f)
         self.symbol = symbol_override if symbol_override else cfg["underlying"]["symbol"]
         self.exchange = cfg["underlying"]["exchange"]
+        # PnL limits from config (defaults 5000): drawdown when total PnL <= -limit, profit when total PnL >= limit
+        tp_cfg = cfg.get("trade_parameters", {})
+        self.drawdown_limit = float(tp_cfg.get("drawdown_limit", 5000))
+        self.profit_limit = float(tp_cfg.get("profit_limit", 5000))
+        self.drawdown_triggered = False
+        self.profit_limit_triggered = False
 
         # Get current ATM price from broker if not provided
         if self.current_atm_price is None:
@@ -128,6 +135,9 @@ class StrategyManager:
 
         self.keep_running = True
         self.paused = False
+        # Single background thread updates shared PnL list every 10s; all strategies use it
+        if not self.test_mode:
+            self.broker.start_pnl_cache_updater(self.ibkr_account_id)
         print(f"[Manager] Created {len(self.strategies)} strategy instances for offsets: {self.strike_range}")
 
     def run(self):
@@ -160,7 +170,33 @@ class StrategyManager:
             # Wait a few seconds before starting the next thread (except for the last one)
             if i < len(self.strategies) - 1:
                 time.sleep(3)  # 3 second delay between thread spawns
-        
+
+        # PnL limit checker: every 30s query DB for total PnL; trigger drawdown or profit limit and stop
+        def _pnl_limit_checker():
+            while self.keep_running:
+                time.sleep(30)
+                if not self.keep_running:
+                    break
+                try:
+                    db = get_db(self.account, self.symbol)
+                    total_pnl = db.get_total_combined_pnl()
+                    if total_pnl <= -self.drawdown_limit:
+                        self.drawdown_triggered = True
+                        set_account_stopped(self.account, self.symbol)
+                        print(f"[Manager] DRAWDOWN LIMIT reached: total_pnl=${total_pnl:.2f} <= -${self.drawdown_limit}; stopping all strategies.")
+                        break
+                    if total_pnl >= self.profit_limit:
+                        self.profit_limit_triggered = True
+                        set_account_stopped(self.account, self.symbol)
+                        print(f"[Manager] PROFIT LIMIT reached: total_pnl=${total_pnl:.2f} >= ${self.profit_limit}; exiting all positions and stopping.")
+                        break
+                except Exception as e:
+                    print(f"[Manager] PnL limit check error: {e}")
+
+        pnl_limit_thread = threading.Thread(target=_pnl_limit_checker, name="PnLLimitChecker", daemon=True)
+        pnl_limit_thread.start()
+        print(f"[Manager] PnL limit checker started (drawdown<=-${self.drawdown_limit}, profit>=${self.profit_limit}, check every 30s)")
+
         # Monitor state file and control strategies
         try:
             while self.keep_running:
