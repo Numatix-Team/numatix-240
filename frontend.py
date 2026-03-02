@@ -923,6 +923,12 @@ def status_indicator():
 # MAIN APP — TABS
 # -------------------------------------
 def main():
+    # Protect the dashboard behind the authentication gate.
+    # Users should run `streamlit run app.py` and authenticate there first.
+    if not st.session_state.get("authenticated", False):
+        st.warning("This dashboard is protected. Please log in via the main app to access it.")
+        st.stop()
+
     st.title("Options Strategy Dashboard")
 
     sync_flags_with_pid()
