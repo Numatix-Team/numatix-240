@@ -6,4 +6,6 @@ streamlit-autorefresh>=0.0.6
 ibapi>=9.81.1
 ib-insync>=0.9.86
 matplotlib>=3.7.0
+bcrypt>=4.0.1
+pyotp>=2.9.0
 

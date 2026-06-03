@@ -32,6 +32,11 @@ def load_json(path):
         return json.load(f)
 
 def main():
+    # Require authentication before allowing access to this page.
+    if not st.session_state.get("authenticated", False):
+        st.warning("Please log in via the main app to access this page.")
+        st.stop()
+
     st.title("Premium vs VWAP Graph Generator")
     
     # Initialize session state
